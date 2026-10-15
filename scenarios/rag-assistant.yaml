@@ -1,0 +1,40 @@
+# 사내 지식 검색(RAG) 상담 챗봇. 모든 대화가 같은 지시문(system)을 쓰고, 턴마다 새 검색 문서가 질문 앞에 붙는다.
+# 원가의 중심이 출력이 아니라 입력(문서)이라 $/1K turns·$/session으로 상담 건당 원가를 본다.
+# 문서는 히스토리에도 남아 다음 턴 입력이 커진다(지난 검색 결과를 빼는 앱보다 크게 잡힌다).
+# 대상: GPU 서버의 vLLM(scripts/vllm-linux.sh). 단계당 3분 30초, 전체 약 11분.
+name: rag-assistant
+seed: 7
+
+target:
+  base_url: http://127.0.0.1:8000/v1
+  model: local-model
+  timeout: 120s
+
+personas:
+  count: 1                            # 상담 지시문 하나를 모든 대화가 공유한다
+  system_prompt_tokens: {min: 1500, max: 1500}
+
+session:
+  language: ko
+  turns: {min: 2, max: 6}
+  user_input_tokens: {dist: lognormal, mean: 40, stddev: 20, min: 5, max: 200}
+  retrieved_tokens: {min: 800, max: 2000}
+  max_output_tokens: {min: 150, max: 400}
+  think_time: {dist: exponential, mean: 20s, min: 3s, max: 60s}
+
+load:
+  mode: concurrency
+  stages:
+    - {concurrency: 10, duration: 3m, warmup: 30s}
+    - {concurrency: 30, duration: 3m, warmup: 30s}
+    - {concurrency: 60, duration: 3m, warmup: 30s}
+
+slo:
+  ttft_p95: 2s
+  itl_p95: 100ms
+  error_rate_max: 0.01
+
+cost:
+  gpu_hourly_usd: 1.09
+  gpu_count: 1
+  label: RunPod L40S

@@ -1,0 +1,1384 @@
+[
+ {
+  "topic": "AIPerf v0.12.0 mock server (tests/aiperf_mock_server) and PyPI aiperf installation. Adversarially re-verified against source, plus read-only runs in the existing scratchpad venv (aiperf 0.12.0 and aiperf-mock-server 0.12.0 on Python 3.12.14) and read-only inspection of an existing smoke-run's artifacts.",
+  "facts": [
+   {
+    "question": "1a. Mock server packaging: is it a separate package, is it in the PyPI wheel, and how do you install and run it?",
+    "answer": "It is a separate setuptools project: name=\"aiperf-mock-server\", version=\"0.12.0\", requires-python \">=3.11,<3.14\". [tool.setuptools] packages=[\"aiperf_mock_server\"] with package-dir {\"aiperf_mock_server\" = \".\"}. The console script is `aiperf-mock-server = \"aiperf_mock_server.__main__:main\"`, and `python -m aiperf_mock_server` also works.\n\nDeclared deps (exact): fastapi>=0.104.1, uvicorn[standard]>=0.24.0, transformers>=4.56.0, pydantic>=2.5.0, pydantic-settings>=2.0.0, cyclopts>=3.0.0, orjson>=3.9.0, prometheus-client>=0.20.0, python-multipart>=0.0.7. The dev extra adds pytest, pytest-asyncio, ruff and pre-commit.\n\nIt is NOT in the aiperf wheel. The root build uses hatchling with only [tool.hatch.metadata] and no build-target override. I confirmed this by run: the PyPI-installed aiperf-0.12.0.dist-info/RECORD has 1613 entries, all under aiperf/, with no tests/ or mock entries.\n\nInstall:\n- In a clone: `make install-mock-server`, which runs `uv pip install -e \"tests/aiperf_mock_server[dev]\"`.\n- Standalone: `cd tests/aiperf_mock_server && uv pip install -e \".[dev]\"`.\n- A NON-editable `pip install <dir>` of an unmodified copy of tests/aiperf_mock_server works. The scratchpad venv has it installed that way from scratchpad/mock-copy/aiperf_mock_server, which diff shows is identical to the v0.12.0 source apart from build artifacts. Note that the test_*.py files get packaged too.\n- `pip install \"git+https://github.com/ai-dynamo/aiperf@v0.12.0#subdirectory=tests/aiperf_mock_server\"` is the same build path, but it is untested and undocumented.\n\nHidden dependency: metrics_utils.py:15 does a top-level `from aiperf.common.aiperf_logger import AIPerfLogger`, and app.py imports metrics_utils. So aiperf is a HARD, undeclared runtime dependency: install aiperf==0.12.0 into the same venv. The other aiperf imports are softer:\n- tokens.py:539-546 (corpus) catches ImportError and falls back to cycling prompt tokens.\n- request_recorder.py:89 (Tokenizer) is lazy and only runs with --record-requests.\n\nConfig precedence: init/CLI kwargs, then env `MOCK_SERVER_*` (case-insensitive), then a `.env` file in the CWD, then defaults (config.py:48-53). set_server_config also writes every field back into os.environ as MOCK_SERVER_<FIELD> (config.py:566-584), which is how the uvicorn workers get the config. It runs `uvicorn.run(\"aiperf_mock_server.app:asgi_app\", host, port, log_level, access_log, workers)` (__main__.py:43-50).\n\nThe integration tests do NOT run it in-process. They start `serve(config=MockServerConfig(host, port, no_tokenizer=True, **kwargs))` in a multiprocessing \"spawn\" subprocess and poll GET /health (tests/integration/conftest.py:22-23, 270-300). GET /health returns {\"status\":\"healthy\",\"config\":...} (app.py:1391-1394).",
+    "evidence": [
+     "tests/aiperf_mock_server/pyproject.toml:9-44",
+     "pyproject.toml:5-10 (hatchling; only [tool.hatch.metadata])",
+     "Makefile:165-166",
+     "Makefile:171-172",
+     "tests/aiperf_mock_server/README.md:72-81",
+     "tests/aiperf_mock_server/__main__.py:21-58",
+     "tests/aiperf_mock_server/__init__.py:9-12",
+     "tests/aiperf_mock_server/config.py:45-53",
+     "tests/aiperf_mock_server/config.py:566-603",
+     "tests/aiperf_mock_server/metrics_utils.py:12-15",
+     "tests/aiperf_mock_server/tokens.py:539-546",
+     "tests/aiperf_mock_server/request_recorder.py:88-95",
+     "tests/integration/conftest.py:22-23",
+     "tests/integration/conftest.py:270-300",
+     "tests/aiperf_mock_server/app.py:1391-1394",
+     "RUN: grep of aiperf-venv/.../aiperf-0.12.0.dist-info/RECORD -> no tests/ or mock entries; aiperf_mock_server-0.12.0.dist-info/direct_url.json -> file:///.../scratchpad/mock-copy/aiperf_mock_server; diff -rq mock-copy vs tests/aiperf_mock_server -> only egg-info/build differ"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1b. Mock server CLI entrypoint and flags (TTFT, ITL or token rate, jitter, error rate, port)",
+    "answer": "`aiperf-mock-server --help` confirms the flags parse FLAT (for example --port, not --config.port). Every bool flag also has a `--no-<flag>` negative. Every field is also available as env MOCK_SERVER_<FIELD_UPPER>.\n\nServer flags:\n- `--port/-p` int, default 8000, 1..65535\n- `--host`, default \"127.0.0.1\"\n- `--workers/-w`, default 1, 1..32\n- `--log-level` DEBUG|INFO|WARNING|ERROR|CRITICAL, default INFO\n- `--verbose/-v`\n- `--access-logs`\n- `--api-key`, default None; auth is only enforced when set, and accepts the raw key or `Bearer <key>`\n- `--auth-header-name`, default Authorization\n- `--default-model`, default \"mock-model\"; only used by GET /v1/models, while requests echo back their own model\n- `--models-ready-delay-seconds`\n- `--disable-models-endpoint`\n- `--inference-ready-delay-seconds` (503 on inference paths until it elapses)\n- `--anthropic-split-usage`\n\n`--fast/-f` sets ttft, itl, embedding_*, ranking_* and image_retrieval_* latencies to 0. It does NOT zero ttft_per_isl_token_ms, ttft_concurrency_quad_ms, itl_per_osl_token_ms, itl_concurrency_lin_ms, the jitter settings or the scheduler.\n\nLatency flags (ms, all >=0):\n- `--ttft/-t`, default 20.0\n- `--itl`, default 5.0\n- `--ttft-per-isl-token-ms`, default 0.0\n- `--ttft-concurrency-quad-ms`, default 0.0\n- `--itl-per-osl-token-ms`, default 0.0\n- `--itl-concurrency-lin-ms`, default 0.0\n\nOpen-loop formulas (utils.py:208-221):\n- ttft_ms = (ttft + ttft_per_isl_token_ms*isl + ttft_concurrency_quad_ms*inflight^2) * lognormal_jitter(ttft_jitter_cv). The jitter is sampled once per request.\n- itl_ms = (itl + itl_per_osl_token_ms*osl + itl_concurrency_lin_ms*inflight) * lognormal_jitter(itl_jitter_cv). The jitter is resampled per token.\n- isl = the mock's user-only, char-based prompt_token_count. osl = the ACTUAL number of generated content tokens (utils.py:423-424), not the max_tokens budget the help text describes.\n- There is no token-rate flag. Per-stream decode rate is about 1000/itl tok/s.\n\nJitter: `--ttft-jitter-cv` and `--itl-jitter-cv`, default 0.0. The factor is lognormal: exp(sigma*Z - sigma^2/2), with sigma = sqrt(ln(1+cv^2)) and mean 1. It is two-sided in open-loop mode; the README calls this \"symmetric\", but lognormal is skewed. In scheduler mode it is positive-only: max(0, factor-1)*cfg.ttft or cfg.itl.\n\nScheduler mode (`--scheduler-enabled`) does NOT sleep for cfg.ttft or cfg.itl and ignores the four penalty knobs. Timing comes only from run_prefill and next_decode_step, plus positive jitter scaled by cfg.ttft and cfg.itl (utils.py:249-274). Scheduler knobs:\n- `--scheduler-step-ms` 5.0 (>0, <=1000)\n- `--scheduler-max-batch-size` 256\n- `--scheduler-max-prefill-chunks-per-step` 8\n- `--scheduler-prefill-chunk-tokens` 512\n- `--scheduler-goodput-collapse-enabled` False\n- `--scheduler-goodput-collapse-threshold` 1.5\n- `--scheduler-goodput-collapse-slope` 0.5\n- `--scheduler-goodput-collapse-floor` 0.3\n\nErrors: `--error-rate` float 0..100 (a PERCENT), default 0.0. The check is `random.random()*100 < error_rate`, and a hit raises HTTPException(500, detail=\"Simulated error\"), so the body is {\"detail\":\"Simulated error\"}. This runs in a decorator after FastAPI body validation and before make_ctx, so it happens before any streaming, inflight tracking or recording.\n\n`--random-seed` int calls random.seed() in the lifespan startup of each worker. The error draws and the jitter draws share that one global RNG. The draw sequence is reproducible, but per-request outcomes are only reproducible when requests arrive in a deterministic order.\n\nTokenizer:\n- `--tokenizer`, default \"builtin\" (tiktoken o200k_base via AIPerf's Tokenizer). It shapes the output-text corpus AND is the tokenizer the --record-requests recorder uses. It is never used for usage.prompt_tokens.\n- `--tokenizer-revision`, default \"main\"\n- `--tokenizer-trust-remote-code`\n- `--no-tokenizer`: character chunking for the corpus\n\nRecording: `--record-requests PATH`. The DCGM, embedding, ranking and image-retrieval flags exist but do not matter here.",
+    "evidence": [
+     "RUN: scratchpad/aiperf-venv/bin/aiperf-mock-server --help (flat flags, defaults, --no-* negatives)",
+     "tests/aiperf_mock_server/config.py:55-82",
+     "tests/aiperf_mock_server/config.py:84-164",
+     "tests/aiperf_mock_server/config.py:166-317",
+     "tests/aiperf_mock_server/config.py:370-415",
+     "tests/aiperf_mock_server/config.py:467-555",
+     "tests/aiperf_mock_server/utils.py:57-69",
+     "tests/aiperf_mock_server/utils.py:77-103",
+     "tests/aiperf_mock_server/utils.py:202-222",
+     "tests/aiperf_mock_server/utils.py:249-274",
+     "tests/aiperf_mock_server/utils.py:276-295",
+     "tests/aiperf_mock_server/utils.py:418-425",
+     "tests/aiperf_mock_server/app.py:113-114",
+     "tests/aiperf_mock_server/app.py:352-361",
+     "tests/aiperf_mock_server/scheduler.py (no reference to ttft/itl/penalty fields)",
+     "tests/aiperf_mock_server/README.md:158",
+     "tests/aiperf_mock_server/README.md:506-512"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1c. Mock server streaming support on /v1/chat/completions",
+    "answer": "Yes. With `stream: true` the route returns StreamingResponse(media_type=\"text/event-stream\") and emits one `data: {\"id\",\"object\":\"chat.completion.chunk\",\"created\",\"model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":tok}}]}` per output token.\n- delta.role=\"assistant\" appears on the first content chunk only when there are no reasoning tokens. Reasoning chunks carry role plus reasoning_content and are streamed first.\n- The last content chunk has finish_reason \"stop\" or \"length\".\n- If `stream_options.include_usage` is truthy, a final chunk with `choices: []` and `usage` follows.\n- The stream ends with `data: [DONE]`.\n- Timing: TTFT before the first emitted token (reasoning or content), then ITL between tokens.\n\nNon-streaming requests sleep TTFT + ITL*len(content tokens) and return object \"chat.completion\" with `usage`.\n\nThe token limit is `max_completion_tokens or max_tokens` (models.py:70-73). AIPerf sends `max_completion_tokens` unless `--use-legacy-max-tokens`, and only when the turn has max_tokens (openai_chat.py:60-66). `min_tokens` and `ignore_eos` are request fields. With ignore_eos, the output is exactly the budget max and finish_reason is \"length\".\n\nInclude_usage is AUTO-added by AIPerf only when streaming and `--use-server-token-count` are both set (openai_chat.py:74-78). The helper preserves any stream_options the author set, including an explicit include_usage (openai_chat.py:148-159). Because payload.update(endpoint.extra) runs first, passing stream_options via --extra-inputs as JSON should also work (inferred). Without either, streamed mock responses carry no usage.\n\nI confirmed by run in the existing smoke artifacts (run with --streaming --use-server-token-count): payload.stream_options.include_usage=True, and the last packet is `{...\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":19,\"total_tokens\":28,\"prompt_tokens_details\":{\"cached_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"accepted_prediction_tokens\":2,\"rejected_prediction_tokens\":1}}}`.\n\nOn client disconnect, LatencySimulator.cancel() frees scheduler slots and increments Counter \"dynamo_frontend_disconnected_clients\" (label model). prometheus_client exposes it as ..._total (inferred).",
+    "evidence": [
+     "tests/aiperf_mock_server/app.py:335-384",
+     "tests/aiperf_mock_server/utils.py:493-559",
+     "tests/aiperf_mock_server/utils.py:177-200",
+     "tests/aiperf_mock_server/utils.py:297-346",
+     "tests/aiperf_mock_server/models.py:47-73",
+     "tests/aiperf_mock_server/tokens.py:436-453",
+     "tests/aiperf_mock_server/metrics.py:546-548",
+     "src/aiperf/endpoints/openai_chat.py:60-78",
+     "src/aiperf/endpoints/openai_chat.py:148-159",
+     "src/aiperf/config/flags/cli_config.py:313-329",
+     "docs/cli-options.md:403-411",
+     "RUN(read-only): scratchpad/smoke/run1/profile_export_raw.jsonl record[1] .payload.stream_options.include_usage=True and .responses[19] usage chunk"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1d. Does the mock return usage with prompt_tokens_details.cached_tokens, and does it simulate prefix caching?",
+    "answer": "OpenAI usage shape (TokenizedText.create_usage): {prompt_tokens, completion_tokens (content + reasoning), total_tokens, prompt_tokens_details:{cached_tokens}, completion_tokens_details:{reasoning_tokens, accepted_prediction_tokens, rejected_prediction_tokens}}.\n\ncached_tokens is FAKE. The computation is `seed = hash(text) & 0x7FFFFFFF`, then `cached_tokens = prompt_tokens * (30 + seed % 31) // 100`, which gives 30-60% of the prompt.\n- It has no dependence on earlier requests or shared prefixes, and no latency effect.\n- `text` is the user-only joined text. hash() is salted per process, so the value for the same prompt changes across restarts unless PYTHONHASHSEED is fixed.\n- Output length uses crc32, so it is stable.\n\nProm endpoints use constants: vllm:prefix_cache_hits is incremented by int(prompt_tokens*0.3) per request, and sglang:cache_hit_rate is set to 0.3.\n\nReal prefix-cache simulation exists ONLY on POST /v1/messages (Anthropic), and only when the request opts in via top-level cache_control or a block-level cache_control on system or message content blocks.\n- The key is (model, sha256(orjson(system) + orjson(messages[0..k]))) at each message boundary, in a process-global set with no TTL and no eviction. It is per-process when workers>1.\n- Accounting is disjoint: input_tokens=0, cache_read = the longest seen prefix's char-proportional share, and cache_creation = the rest.\n- The total it apportions is still the user-only prompt count, because tokens.py:376-378 uses _extract_chat_messages there too.\n- It affects usage only, not latency.\n\nGotcha, confirmed by run: prompt tokens count ONLY role==\"user\" message text, joined with \"\\n\", using a char-based ~4 chars/token chunker whatever --tokenizer is set to. System and assistant text are excluded from usage.prompt_tokens, from the ISL used by --ttft-per-isl-token-ms, and from scheduler prefill. In the smoke run, the same request (system persona + user) was recorded by the recorder with isl=491, while the server reported usage.prompt_tokens=9. A local run of _extract_chat_messages on [system, user, assistant, user] returns only the two user texts.\n\nOutput length without ignore_eos:\n- min = max(1, int(0.8*user_prompt_tokens)) capped at max, or min_tokens if sent.\n- If max or min tokens are sent: count = min + (crc32(\"\\x1f\".join(first 5 prompt tokens)) % 1000) % (max-min+1).\n- If no max is sent: max = max(2*p, 16) and the target range is capped at 1.2*p.\n- Text comes from the Shakespeare corpus (or prompt-token cycling if aiperf is missing), so assistant replies are deterministic filler.\n\nModel names containing \"qwen\" or \"gpt-oss\" (case-insensitive) get reasoning tokens: reasoning_effort low/medium/high = 100/250/500, default medium=250, capped at and deducted from the max budget. They are streamed before content.",
+    "evidence": [
+     "tests/aiperf_mock_server/tokens.py:72-124",
+     "tests/aiperf_mock_server/tokens.py:160-185",
+     "tests/aiperf_mock_server/tokens.py:198-257",
+     "tests/aiperf_mock_server/tokens.py:260-326",
+     "tests/aiperf_mock_server/tokens.py:361-378",
+     "tests/aiperf_mock_server/tokens.py:418-433",
+     "tests/aiperf_mock_server/tokens.py:436-513",
+     "tests/aiperf_mock_server/utils.py:394-426",
+     "tests/aiperf_mock_server/utils.py:653-710",
+     "tests/aiperf_mock_server/app.py:421-460",
+     "tests/aiperf_mock_server/metrics_utils.py:225",
+     "tests/aiperf_mock_server/metrics_utils.py:311",
+     "RUN(read-only): smoke/mock_requests.jsonl line 2 isl=491 (chatcmpl-94ec1c47...) vs smoke/run1/profile_export_raw.jsonl same id usage.prompt_tokens=9",
+     "RUN: venv python _extract_chat_messages([system,user,assistant,user]) -> 'hello there how are you\\ntell me more' (8 tokens)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1e. Can the mock server record the requests it receives?",
+    "answer": "Partly. `--record-requests PATH` opens PATH in \"wb\" mode (truncating it) and writes one flushed JSONL line per request. The exact keys are: ts, request_id, endpoint, model, isl, requested_osl, max_tokens, max_completion_tokens, min_tokens, ignore_eos, reasoning_effort, stream, tokenization_mode. requested_osl = max_completion_tokens if not None, else max_tokens.\n\nOn graceful shutdown (lifespan finally) it writes PATH + \".summary.json\" with per-endpoint distributions and vocab stats, and prints the same summary to stdout. A SIGKILL loses the summary.\n\n`isl` counts ALL roles:\n- Chat requests use apply_chat_template when the tokenizer has one.\n- builtin (_TiktokenAdapter) has none, so it uses a ChatML fallback, `<|im_start|>{role}\\n{content}<|im_end|>` joined by \"\\n\" plus `<|im_start|>assistant\\n`, recorded as tokenization_mode \"chat_template_fallback\".\n- Measured overhead with builtin o200k_base (the markers are not special tokens there): about 14 tokens per message + 8 for the generation prompt. Empty messages gave 36, 64 and 92 tokens for 2, 4 and 6 messages.\n\nThis differs from usage.prompt_tokens, which counts user messages only.\n\nLimits:\n- Message content, headers and session or correlation IDs are NOT recorded.\n- Workers are forced to 1 with a warning.\n- It raises ValueError at config validation if combined with --no-tokenizer.\n- Requests rejected by --error-rate (and 422 validation failures) are never recorded, because error injection wraps the handler before make_ctx and _maybe_record_request run.",
+    "evidence": [
+     "tests/aiperf_mock_server/config.py:68-81",
+     "tests/aiperf_mock_server/config.py:500-511",
+     "tests/aiperf_mock_server/request_recorder.py:115-121",
+     "tests/aiperf_mock_server/request_recorder.py:191-250",
+     "tests/aiperf_mock_server/request_recorder.py:252-279",
+     "tests/aiperf_mock_server/request_recorder.py:309-333",
+     "tests/aiperf_mock_server/request_recorder.py:481-491",
+     "src/aiperf/common/tokenizer.py:41-66",
+     "tests/aiperf_mock_server/utils.py:57-69",
+     "tests/aiperf_mock_server/utils.py:394-454",
+     "tests/aiperf_mock_server/app.py:150-184",
+     "tests/aiperf_mock_server/README.md:531",
+     "RUN: venv python _render_chat_template_fallback + _encode_without_special_tokens(builtin) -> 2 msgs:36, 4:64, 6:92 tokens",
+     "RUN(read-only): smoke/mock_requests.jsonl lines show the 13 keys and tokenization_mode=chat_template_fallback"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "2. PyPI aiperf 0.12.0: Python version, heavy dependencies, CLI entry point, system libraries",
+    "answer": "`requires-python = \">=3.11,<3.14\"`. The scratchpad venv on Python 3.12.14 works. The Dockerfile base is `python:3.13-slim-bookworm@sha256:...`.\n\nCLI: console script `aiperf = \"aiperf.cli:app\"` (cyclopts>=4,<5). Confirmed by `aiperf --help`: the commands are analyze, analyze-trace, chat, config, plot, plugins, profile, service, speed-bench-report, synthesize and validate, plus --install-completion and --version. `python -m aiperf` works via src/aiperf/__main__.py. The entry-point group is `aiperf.plugins` with `aiperf = \"aiperf.plugin:plugins.yaml\"`.\n\nBase dependencies (all required):\n- transformers>=4.56.0, huggingface-hub>=0.34,<2, tiktoken>=0.7,<1, sentencepiece>=0.2, protobuf>=4\n- datasets>=3.0 and pyarrow>=18, both excluded on Windows ARM64\n- pandas~=2.3.3, numpy>=1.26.4,<3, scipy>=1.13\n- matplotlib>=3.10, seaborn~=0.13.2, plotly~=6.4.0, kaleido~=1.2.0, dash~=3.1.0, dash-bootstrap-components~=2.0.0\n- optuna>=3.6, textual~=5.3.0, pyzmq~=26.4.0, aiohttp~=3.13.3\n- fastapi>=0.115,<1, uvicorn[standard]>=0.34,<1, uvloop (not on Windows)\n- pillow~=12.2.0, soundfile~=0.13.1, ffmpeg-python~=0.2.0\n- nvidia-ml-py, crick~=0.0.8, zstandard>=0.25, orjson~=3.11.7, msgspec, psutil~=7.0.0, setproctitle, prometheus_client~=0.23.1, rich~=14.1.0\n- also aiofiles, filelock, jinja2, jmespath, ruamel.yaml, starlette-compress, tqdm, pydantic and pydantic-settings\n\ntorch is only pulled in by the botorch extra. Extras: mlflow, wandb, otel, test, dev (= mlflow, otel, test, wandb plus tools), botorch, optuna (= aiperf[botorch]) and accuracy (latex2sympy2-extended, lighteval, sympy, deepeval).\n\nSystem requirements:\n- None for macOS, Linux x86_64 or Windows (wheels).\n- Linux aarch64 needs a C compiler because crick is sdist-only there (README).\n- The ffmpeg binary is only for synthetic video (shutil.which check).\n- Chrome or Chromium is only for PNG export in `aiperf plot` (kaleido).\n- An NVIDIA driver is only for GPU telemetry (inferred).\n\nNetwork: \"builtin\" = tiktoken `o200k_base` via tiktoken.get_encoding, which downloads once unless it is cached under TIKTOKEN_CACHE_DIR, DATA_GYM_CACHE_DIR or <tmp>/data-gym-cache. The source comment says \"no network after first cache\".\n\n`aiperf profile --tokenizer` defaults to the model name. For placeholder names such as mock-model, test-model or fake-model it auto-substitutes builtin with a warning.",
+    "evidence": [
+     "pyproject.toml:22-76",
+     "pyproject.toml:78-84",
+     "pyproject.toml:86-147",
+     "pyproject.toml:155-167",
+     "src/aiperf/cli.py:24-42",
+     "src/aiperf/__main__.py:1-7",
+     "RUN: scratchpad/aiperf-venv/bin/aiperf --help (v0.12.0 command list)",
+     "RUN: venv python --version -> 3.12.14; aiperf-0.12.0.dist-info/entry_points.txt",
+     "README.md:41-59",
+     "Dockerfile:4",
+     "src/aiperf/dataset/generator/video.py:40-42",
+     "src/aiperf/cli_commands/plot.py:32",
+     "src/aiperf/plot/exporters/png/base.py:34-50",
+     "src/aiperf/common/tokenizer.py:25-26",
+     "src/aiperf/common/tokenizer.py:237-262",
+     "src/aiperf/common/tokenizer.py:673-689",
+     "docs/cli-options.md:452-454"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "3. Is there anything in AIPerf that could replace a custom mock server with prefix-cache simulation (cached_tokens emulation, TTFT reduction on cache hit)?",
+    "answer": "No, not for OpenAI /v1/chat/completions. Nothing in v0.12.0 emulates prefix-aware cached_tokens, and nothing lowers TTFT on a cache hit.\n1. The OpenAI mock's cached_tokens is a hash-based 30-60% of the user-only prompt tokens.\n2. The Anthropic /v1/messages mock hashes prefixes at message boundaries, keyed by (model, digest). It only does so when cache_control is present, affects usage only, and apportions a user-only token total.\n3. The scheduler has no KV-block accounting (README:527: \"No KV-block accounting, no preemption, no swap\"), and its prefill uses the user-only ISL.\n4. TheoreticalPrefixCacheAccumulator (plugins.yaml key `theoretical_prefix_cache`, tag `theoretical_prefix_cache_hit`) only consumes theoretical_prefix_cache_hit_blocks and total_blocks stamped by the WEKA trace loader (weka_trace.py:1948, 2295, 2389, 2859, 2919). No custom or multi_turn loader sets them.\n5. agentic_code_gen/reporting/simulation_engine.py is an offline KV-pressure simulator for reports, not a server.\n\nConclusion: we need our own small FastAPI mock that does the following:\n- computes cached_tokens as the longest previously seen token prefix over the full message list, including system and assistant turns;\n- scales TTFT with uncached tokens only;\n- counts prompt_tokens over all roles.\nMonkeypatching aiperf_mock_server (tokens._extract_chat_messages, TokenizedText.create_usage, LatencySimulator isl) is possible, but it is not on PyPI.\n\nPost-processing: AIPerf's metric `overall_usage_prompt_cache_read_pct` = total_usage_prompt_cache_read_tokens / total_usage_prompt_tokens * 100 is our exact formula. It raises NoMetricValue when total prompt tokens are 0. The per-request tags are `usage_prompt_cache_read_tokens` and `usage_prompt_tokens`.\n\nUsage.prompt_cache_read_tokens precedence:\n1. prompt_tokens_details.cached_tokens or input_tokens_details.cached_tokens\n2. top-level cache_read_input_tokens, prompt_cache_hit_tokens, cachedContentTokenCount or cacheReadInputTokens\n\nUsage metrics are NOT gated by --use-server-token-count, but streaming responses need include_usage (see 1c).\n\nConfirmed by run: smoke/run1/profile_export_aiperf.json has top-level keys `overall_usage_prompt_cache_read_pct` {\"unit\":\"%\",\"avg\":39.01...}, `total_usage_prompt_cache_read_tokens` {\"avg\":71.0} and `total_usage_prompt_tokens` {\"avg\":182.0}. These are derived values stored under \"avg\".",
+    "evidence": [
+     "tests/aiperf_mock_server/tokens.py:97-102",
+     "tests/aiperf_mock_server/utils.py:653-710",
+     "tests/aiperf_mock_server/app.py:421-460",
+     "tests/aiperf_mock_server/README.md:527",
+     "src/aiperf/metrics/theoretical_prefix_cache.py:21-37",
+     "src/aiperf/plugin/plugins.yaml:1071-1072",
+     "src/aiperf/dataset/loader/weka_trace.py:1948",
+     "src/aiperf/dataset/agentic_code_gen/reporting/simulation_engine.py:4-18",
+     "src/aiperf/metrics/types/usage_total_metrics.py:47",
+     "src/aiperf/metrics/types/usage_total_metrics.py:134",
+     "src/aiperf/metrics/types/usage_total_metrics.py:320-362",
+     "src/aiperf/metrics/types/usage_cache_metrics.py:33-62",
+     "src/aiperf/common/models/usage_models.py:327-346",
+     "src/aiperf/post_processors/base_metrics_processor.py:50-55",
+     "src/aiperf/records/inference_result_parser.py:308-316",
+     "src/aiperf/metrics/cache_reporting_hint.py:24-30",
+     "RUN(read-only): python json.load(smoke/run1/profile_export_aiperf.json) cache keys"
+    ],
+    "confidence": "verified-by-run"
+   }
+  ],
+  "openIssues": [
+   "Unverified: whether the PyPI sdist aiperf-0.12.0.tar.gz contains tests/aiperf_mock_server. The wheel definitely does not.",
+   "Untested: `pip install git+https://github.com/ai-dynamo/aiperf@v0.12.0#subdirectory=tests/aiperf_mock_server` (no network used). A non-editable install of an identical local copy of the directory works, and needs aiperf==0.12.0 in the same venv (metrics_utils.py:15).",
+   "README/help versus code contradiction: README.md:479 says the penalty knobs are 'additive' with the scheduler, but utils.py:249-274 (scheduler path) never applies ttft, itl, ttft_per_isl_token_ms, ttft_concurrency_quad_ms, itl_per_osl_token_ms or itl_concurrency_lin_ms, and scheduler.py never references them. With --scheduler-enabled, those flags only scale positive jitter (cfg.ttft and cfg.itl) or do nothing.",
+   "Help versus code: the --itl-per-osl-token-ms help says OSL = the max_tokens budget, but make_ctx passes osl=len(tokenized.tokens), the actual generated content length (utils.py:424).",
+   "The mock README and --tokenizer help say 'builtin' needs 'zero network access', but tiktoken.get_encoding('o200k_base') downloads once unless cached (tokenizer.py:237-262, 675). Offline CI should pre-seed TIKTOKEN_CACHE_DIR. --no-tokenizer skips the corpus tokenizer but is incompatible with --record-requests.",
+   "Mock cached_tokens uses the salted Python hash() (tokens.py:98), so the cache% for identical prompts varies across server restarts unless PYTHONHASHSEED is fixed. Tests must not expect exact cache% from the stock mock.",
+   "--random-seed makes the global RNG draw sequence reproducible, but error and jitter draws interleave across concurrent requests. Per-request outcomes are therefore only reproducible under deterministic ordering, for example concurrency 1 (inferred).",
+   "The output-length seed is crc32 of the first 5 user-prompt tokens. Every user message is joined in order, so the first user message dominates, and within a session every turn likely gets the same seed and correlated output lengths (inferred). Per-turn max tokens is only an upper bound unless ignore_eos is sent (for example via --extra-inputs ignore_eos:true or the per-turn extra_body).",
+   "The mock reads a `.env` file from its CWD via pydantic-settings (config.py:51). A stray .env with MOCK_SERVER_* keys in the wrapper's working directory would silently change mock config.",
+   "Not checked: the exact Prometheus exposition name of the disconnect counter. prometheus_client normally appends _total, giving dynamo_frontend_disconnected_clients_total."
+  ],
+  "corrections": [
+   {
+    "question": "1b",
+    "before": "`--fast/-f`: sets ttft, itl and all other latencies to 0",
+    "after": "--fast zeroes ttft, itl and the embedding/ranking/image-retrieval latencies only. It does NOT zero ttft_per_isl_token_ms, ttft_concurrency_quad_ms, itl_per_osl_token_ms, itl_concurrency_lin_ms, the jitter settings or the scheduler.",
+    "reason": "config.py:59-67 sets only those eight fields."
+   },
+   {
+    "question": "1b",
+    "before": "Jitter ... It is symmetric in open-loop mode and positive-only in scheduler mode.",
+    "after": "The jitter is a lognormal, mean-1 multiplier (exp(sigma*Z - sigma^2/2)). It is two-sided in open-loop mode (the README says 'symmetric', but lognormal is skewed) and positive-only in scheduler mode. Scheduler mode also ignores the base --ttft/--itl sleeps and all four penalty knobs.",
+    "reason": "utils.py:77-103 and 249-274; scheduler.py has no ttft/itl references."
+   },
+   {
+    "question": "1b",
+    "before": "Tokenizer: `--tokenizer` ... It only shapes the corpus used for output text.",
+    "after": "--tokenizer shapes the output corpus AND is the tokenizer the --record-requests recorder uses to compute isl. It never affects usage.prompt_tokens, which is char-based and user-only.",
+    "reason": "app.py:150-158 passes server_config.tokenizer to RequestRecorder; README.md:158; tokens.py:252-257."
+   },
+   {
+    "question": "1b/open issue",
+    "before": "Assumed from the cyclopts Parameter names, not run: that the mock's flags parse flat (--port, not --config.port).",
+    "after": "Confirmed by run: the flags are flat, and every bool flag has a --no-* negative.",
+    "reason": "Output of scratchpad/aiperf-venv/bin/aiperf-mock-server --help."
+   },
+   {
+    "question": "1a",
+    "before": "The integration tests start it in-process with `from aiperf_mock_server import MockServerConfig, serve`.",
+    "after": "The integration tests import MockServerConfig and serve, then run serve(config=MockServerConfig(host, port, no_tokenizer=True, ...)) in a multiprocessing 'spawn' subprocess and poll GET /health.",
+    "reason": "tests/integration/conftest.py:270-300."
+   },
+   {
+    "question": "1a",
+    "before": "HIDDEN DEPENDENCY: ... it also imports aiperf's Tokenizer, PromptGenerator and shakespeare corpus.",
+    "after": "The only hard, import-time aiperf dependency is metrics_utils.py:15 (AIPerfLogger). The corpus imports (tokens.py:539-546) catch ImportError and fall back to prompt-token cycling. The recorder's Tokenizer import (request_recorder.py:89) is lazy and only runs with --record-requests.",
+    "reason": "Code structure: try/except ImportError at tokens.py:539-546, and a lazy import inside open()."
+   },
+   {
+    "question": "1e",
+    "before": "a ChatML fallback (`chat_template_fallback`) for `builtin`, which inflates ISL by about 5*(2N+1) tokens.",
+    "after": "With builtin o200k_base, the ChatML markers are not special tokens, so the fallback adds about 14 tokens per message plus about 8 for the generation prompt (measured: 36, 64 and 92 tokens for 2, 4 and 6 empty messages).",
+    "reason": "Run in the venv with _render_chat_template_fallback and _encode_without_special_tokens on the builtin tokenizer."
+   },
+   {
+    "question": "1c",
+    "before": "AIPerf only adds `stream_options.include_usage` when the `--use-server-token-count` flag is set, so without that flag streamed responses from the mock carry no usage at all.",
+    "after": "AIPerf auto-adds include_usage only when streaming and --use-server-token-count are both set. A user-supplied stream_options (for example via --extra-inputs JSON, which is merged into the payload first) is preserved and would also work (inferred). Usage/cache metrics themselves are not gated by the flag.",
+    "reason": "openai_chat.py:68-78 and 148-159; base_metrics_processor.py:52-55 only gates USAGE_DIFF_ONLY metrics."
+   },
+   {
+    "question": "1c",
+    "before": "The first chunk's delta includes `role: assistant`.",
+    "after": "role=assistant is on the first content chunk only when there are no reasoning tokens. Reasoning chunks (qwen or gpt-oss models) come first and each carries role.",
+    "reason": "utils.py:500-527."
+   },
+   {
+    "question": "1d",
+    "before": "Output length (without ignore_eos) falls in `[min(int(0.8 * user_prompt_tokens), max), max]`, chosen by crc32 of the first 5 prompt tokens.",
+    "after": "min = max(1, int(0.8*p)) capped at max, or min_tokens if sent. count = min + (crc32 % 1000) % (max - min + 1), so the spread above min is at most 999. If no max tokens are sent, max = max(2p, 16) and the upper bound is also capped at 1.2p.",
+    "reason": "tokens.py:260-274 and 456-490."
+   },
+   {
+    "question": "1d",
+    "before": "Real prefix-cache simulation ... hashes sha256 of the serialized `system + messages[:k]` ...",
+    "after": "The cache key is (model, sha256(...)). The total it apportions is the user-only char-based prompt count (tokens.py:376-378), and it splits that total char-proportionally across the serialized system+messages prefix.",
+    "reason": "utils.py:689-710; tokens.py:376-378."
+   },
+   {
+    "question": "2",
+    "before": "The Docker image uses python:3.13-slim.",
+    "after": "The Docker image uses python:3.13-slim-bookworm, pinned by sha256 digest.",
+    "reason": "Dockerfile:4."
+   },
+   {
+    "question": "2",
+    "before": "src/aiperf/common/tokenizer.py:240-262",
+    "after": "src/aiperf/common/tokenizer.py:237-262 (def _is_tiktoken_cached is at line 237)",
+    "reason": "The line reference was off by 3."
+   },
+   {
+    "question": "2 (addition)",
+    "before": "(not stated)",
+    "after": "`aiperf profile --tokenizer` defaults to the model name. Placeholder names such as mock-model, test-model or fake-model automatically become builtin with a warning.",
+    "reason": "docs/cli-options.md:452-454. This matters for offline and mock runs."
+   },
+   {
+    "question": "open issue -> fact",
+    "before": "The stock mock's usage.prompt_tokens and ISL-based TTFT ignore system and assistant messages (listed only as an open issue).",
+    "after": "Confirmed by run: the same request was recorded with recorder isl=491 (all roles, including the persona system prompt) while the server reported usage.prompt_tokens=9 (user only).",
+    "reason": "Read-only comparison of smoke/mock_requests.jsonl line 2 with smoke/run1/profile_export_raw.jsonl for request chatcmpl-94ec1c47."
+   }
+  ]
+ },
+ {
+  "topic": "AIPerf v0.12.0 custom dataset input format (multi_turn JSONL) for a persona character-chat workload: adversarially re-verified",
+  "facts": [
+   {
+    "question": "1. Exact JSONL schema for the custom multi_turn dataset, including CLI flag names and a minimal example line with a leading system turn",
+    "answer": "Flags: `--input-file <path.jsonl>` and `--custom-dataset-type multi_turn`. The CLI prints the choices in kebab case (`multi-turn`), but both `multi_turn` and `multi-turn` parse to format=multi_turn.\n\nEach non-empty, stripped line is read with orjson and validated as `MultiTurn`. Top-level fields:\n- `session_id` (str | None). If it is missing, a seeded SessionIDGenerator creates one.\n- `turns` (list[SingleTurn], required, must be non-empty).\n- optional `type: \"multi_turn\"`.\nUnknown top-level keys are accepted and ignored, because AIPerfBaseModel sets `extra=\"allow\"`.\n\nFields on each turn (`SingleTurn`):\n- Text: `text` (str) or `texts` (list[str] or list[{name, contents}]).\n- Media: `image`/`images`, `image_uuids`, `audio`/`audios`, `video`/`videos`.\n- `role` (str | None; None is sent as \"user\").\n- `delay` (int | float, ms).\n- `timestamp` (int | float, ms).\n- `output_length` (int, gt=0; 0 is a ValidationError).\n- `extra` (dict, shallow-merged into the request body).\n- `session_id`: accepted at turn level, but the multi_turn loader ignores it.\n\nValidators:\n- Each pair text/texts, image/images, audio/audios, video/videos, timestamp/delay is rejected only when both values are truthy. For example, `timestamp:0` with `delay:5` passes.\n- At least one modality is required. A turn with only `role` is a ValidationError.\n\nUnknown turn keys such as `max_tokens` or `temperature` are silently ignored. Use `output_length` or `extra` instead.\n\nLines that share a `session_id` are merged into one conversation, with turns appended in file order. Emit unique ids.\n\nEvery turn that is not hoisted becomes its own request, including role=assistant turns. You cannot pre-seed assistant history with multi_turn; emit only user turns after the system turn.\n\nMinimal line:\n{\"session_id\":\"s-000001\",\"turns\":[{\"role\":\"system\",\"text\":\"You are Captain Mira Voss, ...\"},{\"text\":\"Hi, who are you?\",\"output_length\":128},{\"text\":\"Tell me about the drift.\",\"delay\":4230.5,\"output_length\":96}]}",
+    "evidence": [
+     "src/aiperf/dataset/loader/models.py:47-164 (SingleTurn; validators :121-134, :159-164)",
+     "src/aiperf/dataset/loader/models.py:167-190 (MultiTurn)",
+     "src/aiperf/common/models/base_models.py:19 (extra=\"allow\")",
+     "src/aiperf/dataset/loader/multi_turn.py:167-178 (grouping by session_id), :204-219 (every non-hoisted turn appended), :271-283 (_build_turn)",
+     "src/aiperf/dataset/loader/base_loader.py:154-191 (orjson per non-empty stripped line, at :182-191)",
+     "src/aiperf/config/flags/cli_config.py:520-532 (--input-file), :588-603 (--custom-dataset-type)",
+     "src/aiperf/endpoints/base_endpoint.py:213 (DEFAULT_TURN_ROLE='user'), :295-305",
+     "Run: scratchpad/topic-dataset-format/verify_probe.py. Both `--custom-dataset-type multi_turn` and `multi-turn` gave `format=multi_turn`.",
+     "Run: MultiTurn.model_validate({...,\"timestamp\":0,...}).model_extra == {'timestamp': 0}. output_length=0, empty turns and a role-only turn each gave ValidationError. timestamp=0 with delay=5 was accepted."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "2. How a leading role:system turn is hoisted into system_message, whether it is re-sent on every turn, and the exact conditions for hoisting",
+    "answer": "The first turn of a session is lifted into `Conversation.system_message` (its text contents joined with \"\\n\") and is not counted as a turn. This only happens when ALL of the following hold:\n(a) `_hoist_leading_system_message` is True (it is for multi_turn);\n(b) the endpoint metadata has `consumes_system_message: true`, which in v0.12.0 means chat, responses, messages and chat_embeddings, but not completions;\n(c) `role == \"system\"`, `conversation.turns` is empty and `system_message` is None;\n(d) `timestamp`, `delay`, `output_length` and `extra` are all None. Even `\"delay\": 0` blocks the hoist.\n(e) there is no image, audio or video, and the joined text is non-empty.\n\nThe hoist is undone in two cases, and the system turn is then sent as a normal turn:\n- the session has no other turns;\n- the first remaining turn is also role=system.\n\nThe system message is re-sent on every turn:\n- The worker passes `session.conversation.system_message` into every RequestInfo.\n- `ChatEndpoint._format_messages` prepends {role: system, content: ...} unless the rendered messages already start with a system message.\n\nDuring WARMUP only, `Worker._system_message_for_phase` returns \"warmup\\n\" + persona, unless a cache-bust target is active. A conversation with no persona gets the plain system message \"warmup\". Warmup therefore never primes the persona prefix that profiling uses.",
+    "evidence": [
+     "src/aiperf/dataset/loader/multi_turn.py:124,191-194,221-241,257-269,285-329",
+     "src/aiperf/plugin/plugins.yaml:184-199 (chat consumes_system_message: true), :213-224 (completions: none), :238, :255, :271",
+     "src/aiperf/workers/worker.py:1031-1050, :1341-1369",
+     "src/aiperf/endpoints/openai_chat.py:83-108",
+     "src/aiperf/common/constants.py:21 (WARMUP_SYSTEM_MESSAGE_PREFIX = CreditPhase.WARMUP = \"warmup\")",
+     "tests/unit/dataset/loader/test_multi_turn.py:638,685,712,807,896",
+     "docs/tutorials/custom-dataset.md:319-345",
+     "Run: scratchpad/topic-dataset-format/session_probe.py, using the real UserSessionManager and ChatEndpoint. T0 messages were [system PERSONA, user u1]; T1 messages were [system PERSONA, user u1, assistant A1, user u2]; the warmup system message was 'warmup\\nPERSONA'."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "3. Per-turn max output tokens, whether it maps to max_tokens or max_completion_tokens, and how to add ignore_eos, temperature or arbitrary extra body fields (--extra-inputs syntax)",
+    "answer": "Per-turn max output tokens: the turn field `output_length` becomes `Turn.max_tokens`.\n- The chat endpoint sends it as `max_completion_tokens`, or as `max_tokens` with `--use-legacy-max-tokens`.\n- A per-turn value wins over the global `--osl` / `--output-tokens-mean` / `--prompt-output-tokens-mean`. The global fallback is sampled per turn as a positive normal with mean --osl and stddev `--osl-stddev`.\n- With neither set, no token-limit field is sent.\n- Only the dispatching turn's value is used (`turns[-1].max_tokens`).\n\nPayload build order:\n1. {messages, model, stream}. `stream` is always present, false when not streaming.\n2. tools, if any.\n3. The token-limit field.\n4. `.update(--extra-inputs)`, which is `endpoint.extra`.\n5. `.update(turns[-1].extra_body)`.\n6. With `--streaming` and `--use-server-token-count`, `stream_options.include_usage` is set.\nSo per-turn `extra` beats `--extra-inputs`, and both beat generated fields. Per-turn `extra` applies only to its own turn.\n\n`--extra-inputs` (consume_multiple) forms:\n- `--extra-inputs ignore_eos:true temperature:0.7`\n- `ignore_eos:true,temperature:0.7`\n- a JSON object string: `'{\"ignore_eos\": true, \"chat_template_kwargs\": {\"enable_thinking\": false}}'`.\n\nValue coercion for key:value pairs:\n- true/false become bool; none/null become None.\n- Digit strings become int, including negative ones; a leading-zero string such as `042` stays a string.\n- A value with exactly one '.' and digits becomes float.\n- Anything else stays a string, e.g. `1e-5`.\n- Commas always split pairs.\nUse the JSON form for nested values, lists or scientific notation.",
+    "evidence": [
+     "src/aiperf/dataset/loader/multi_turn.py:271-283",
+     "src/aiperf/endpoints/openai_chat.py:33-81",
+     "src/aiperf/dataset/composer/base.py:412-458 (_set_max_tokens), :460-477",
+     "src/aiperf/config/flags/cli_config.py:301-311 (--use-legacy-max-tokens), :313-330 (--use-server-token-count), :486-499 (--extra-inputs), :1302-1322 (--osl aliases)",
+     "src/aiperf/config/loader/parsing.py:149-170 (coerce_value), :188-207, :210-239",
+     "docs/tutorials/custom-dataset.md:165-204,290",
+     "Run: verify_probe.py. `--extra-inputs ignore_eos:true temperature:0.7` gave endpoint.extra {'ignore_eos': True, 'temperature': 0.7}. The JSON form gave {'ignore_eos': True, 'chat_template_kwargs': {'enable_thinking': False}}.",
+     "Run: session_probe.py. The T0 payload had max_completion_tokens 8 and the T1 payload had 16, both from per-turn output_length; `stream` was false."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "4. Is user text sent verbatim? Is a tokenizer still required for custom datasets? What does --tokenizer default to, and is there an offline/builtin option?",
+    "answer": "Verbatim: yes.\n- MediaConversionMixin encodes only image, audio and video. Text contents pass through unchanged.\n- A single text renders as `content: \"<string>\"`; several texts render as a list of text parts.\n- Whitespace is preserved. --isl/--osl do not rewrite file text, because the prompts subtables are dropped for FILE datasets.\n\nTokenizer: still loaded. DatasetManager always calls `Tokenizer.from_pretrained(tokenizer.name or model_name)` for endpoints with `tokenizes_input` (chat has it), even with `--use-server-token-count`. That flag disables client-side token counting in the record processors and skips the pre-flight `validate_tokenizer_early` for non-synthetic datasets.\n\n`--tokenizer` default: None, which means the model name is used.\n\nCORRECTION: the automatic placeholder-to-`builtin` switch (e.g. `mock-model`, `test-model`) is done only inside `validate_tokenizer_early`. That function returns early under `--use-server-token-count` with a file dataset, so no switch happens. DatasetManager then tries to load the raw model name from the HF Hub. Names containing '/' are never treated as placeholders.\n\nOffline options:\n- `--tokenizer builtin` (tiktoken o200k_base). The o200k_base BPE file is downloaded once on first use and cached under TIKTOKEN_CACHE_DIR / DATA_GYM_CACHE_DIR / <tmp>/data-gym-cache.\n- Another tiktoken encoding name, such as `cl100k_base`.\n- A local path.\n- An HF cache with HF_HUB_OFFLINE=1.\n\nThe wrapper should always pass `--tokenizer` explicitly (builtin or a path) together with `--use-server-token-count`.",
+    "evidence": [
+     "src/aiperf/dataset/loader/mixins.py:46-97 (only IMAGE/VIDEO/AUDIO encoded)",
+     "src/aiperf/endpoints/base_endpoint.py:295-335",
+     "src/aiperf/config/flags/_converter_dataset.py:383-399 (prompt subtables dropped for FILE)",
+     "src/aiperf/dataset/dataset_manager.py:236-248, :332-345",
+     "src/aiperf/common/tokenizer_validator.py:249-254 (early return), :275-293 (placeholder fallback lives after it)",
+     "src/aiperf/common/tokenizer_fake_names.py:18-73",
+     "src/aiperf/records/payload_retention.py:42-61; src/aiperf/records/inference_result_parser.py:77-83, :309-316",
+     "src/aiperf/config/tokenizer.py:38-50, :97-107",
+     "src/aiperf/config/flags/cli_config.py:422-438",
+     "src/aiperf/common/tokenizer.py:25-38, :227-265, :468-518",
+     "docs/reference/tokenizer-auto-detection.md:22-48",
+     "Run: scratchpad/topic-dataset-format/tok_probe.py. With `--model mock-model` and `--use-server-token-count`, the validator returned None, cfg.tokenizer.name stayed None, and DatasetManager would load 'mock-model'. Without the flag the validator returned {'mock-model': 'builtin'}."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "5. How sessions are selected from the dataset, what happens when the dataset is exhausted during a duration-based run, and whether the same session content can be sent twice concurrently",
+    "answer": "Flag: `--dataset-sampling-strategy {random|sequential|shuffle}`, default None. FileDataset.sampling defaults to SEQUENTIAL and the multi_turn loader prefers SEQUENTIAL, so the resolved value is sequential.\n- sequential: order of first appearance of each session_id; wraps forever.\n- random: uniform with replacement (rng.derive('dataset.sampler.random')).\n- shuffle: a permutation, reshuffled after each pass.\n\nOne sampler and one ConversationSource are built per aiperf process and shared by warmup and profiling. Warmup therefore takes the first entries. RequestRateStrategy also pre-samples the next session at the start of each phase and drops it when the phase ends, so warmup uses at least (sessions started + 1) entries.\n\nExhaustion: nothing stops the run when the dataset runs out; the samplers wrap. The run ends on --benchmark-duration, --request-count or --conversation-num.\n- With none of these (non-fixed modes), `requests=10`.\n- --request-count counts every turn sent.\n- A duration stop blocks all later turns, including continuations of sessions already running.\n- `--conversation-num N` maps to phases.profiling.sessions for multi_turn, even though its help says synthetic/random_pool. It stops new sessions and lets started ones finish.\n- --request-count and --conversation-num also set FileDataset.entries, which is used only by random_pool and has no effect on multi_turn.\n\nConcurrent duplicates: possible. Each sample gets a fresh uuid4 `x_correlation_id`, and worker sessions are keyed by it. `--allow-dataset-wrap` applies only to weka/agentic replay.\n\nGenerate more unique sessions than a stage consumes, or one file per stage. Each aiperf invocation restarts sequential sampling at line 1.",
+    "evidence": [
+     "src/aiperf/dataset/dataset_samplers.py:32-86",
+     "src/aiperf/dataset/loader/multi_turn.py:162-165",
+     "src/aiperf/config/dataset/resolver.py:237-249 (_resolve_sampling), :427-441 (_get_preferred_sampling)",
+     "src/aiperf/config/dataset/config.py:340-349",
+     "src/aiperf/config/flags/cli_config.py:653-666, :668-682 (allow_dataset_wrap)",
+     "src/aiperf/timing/phase_orchestrator.py:115-135, :181-184",
+     "src/aiperf/timing/strategies/request_rate.py:147, :202-211 (pre-sampled next session)",
+     "src/aiperf/timing/conversation_source.py:182-191",
+     "src/aiperf/workers/worker.py:1012-1027",
+     "src/aiperf/timing/phase/stop_conditions.py:139-207",
+     "src/aiperf/config/flags/_converter_profiling.py:16-26, :271-279",
+     "src/aiperf/config/flags/_converter_dataset.py:314-353, :383-386; src/aiperf/dataset/composer/custom.py:308-317 (entries used only for random_pool)",
+     "Run: verify_probe.py. With no bound, requests=10 and sampling resolved to SEQUENTIAL. `--conversation-num 5` gave sessions=5, requests=None, entries=5."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "6. Per-turn 'delay' semantics (unit, measured from what, which timing modes) and per-turn 'timestamp' semantics for fixed schedule",
+    "answer": "`delay` is in ms (float allowed, about 1 ms precision). It is the wait before this turn, counted from the moment the previous turn's credit returns, i.e. after the previous response has finished. It is applied with `schedule_later(delay_ms/1000)`.\n\nRequest-rate strategy (covers `--concurrency` alone = CONCURRENCY_BURST, and `--request-rate` with poisson/constant/gamma):\n- `delay` is honoured, and the turn is then queued.\n- In rate mode each tick issues ONE credit, and a queued continuation is issued before any new session. The rate is therefore a total request rate, and think time becomes delay plus the wait for the next tick.\n- Missed ticks are dropped: the loop resets to now instead of bursting.\n- A tick with no free session slot is skipped (try_issue_credit returns None), and no drop counter records it.\n\nConcurrency mode: the session slot is held through think time and released on the final turn.\n\n`--user-centric-rate`: per-turn `delay` is ignored; the gap is num_users/rate.\n\nTurn 0's `delay` is ignored in all live modes.\n\n`--conversation-turn-delay-*` flags apply only to synthetic data. `--ignore-trace-delays` affects only weka_trace.\n\n`--inter-turn-delay-cap-seconds` also clamps multi_turn delays. Its help text names only the DAG and baseten loaders, but multi_turn reads FileDataset.inter_turn_delay_cap_seconds too. Without a cap, a delay over 60 s logs a warning, and NaN/Inf become None.\n\nFixed schedule (`--fixed-schedule`; multi_turn is never auto-promoted):\n- The first dispatched turn of each conversation must carry `timestamp`. Put it on the first USER turn, because on the system turn it blocks the hoist.\n- The first turn is sent at start + (ts - zero). Zero is the smallest first timestamp with --fixed-schedule-auto-offset, otherwise --fixed-schedule-start-offset or 0.\n- For later turns, `timestamp` (absolute; sent at once if already past) wins over `delay`. With neither, the turn is sent at once.\n- Each conversation plays once and the sampler is not used.\n\nCORRECTION (verified): config resolution rejects `--fixed-schedule` + multi_turn unless the FIRST JSONL line has a TOP-LEVEL `timestamp` or `delay` key. Otherwise it fails with: `ValueError: Phase 'profiling' uses fixed_schedule which requires timestamp or delay fields in the dataset, but dataset 'main' has no timing data in its first record`. A top-level `\"timestamp\": <n>` on line 1 passes, is ignored by MultiTurn (extra=allow), and hoisting still works.\n\nAlso verified: with --fixed-schedule, the converter sets `requests` = number of non-empty lines (sessions, not turns). It does this even when --conversation-num or --benchmark-duration is given; only an explicit --request-count overrides it.",
+    "evidence": [
+     "src/aiperf/dataset/loader/models.py:97-104",
+     "src/aiperf/timing/strategies/request_rate.py:128-232 (main loop), :234-279 (handle_credit_return)",
+     "src/aiperf/timing/conversation_source.py:102-122 (build_first_turn ignores delay)",
+     "src/aiperf/timing/config.py:47-48",
+     "src/aiperf/credit/issuer.py:353-406 (try_issue_credit returns None when no slot)",
+     "src/aiperf/credit/callback_handler.py:620-623",
+     "src/aiperf/timing/strategies/user_centric_rate.py:389-426",
+     "src/aiperf/timing/strategies/fixed_schedule.py:76-178",
+     "src/aiperf/common/loop_scheduler.py:194-221",
+     "src/aiperf/dataset/loader/multi_turn.py:132-142, :279; src/aiperf/dataset/loader/_delay_cap.py:15-41; src/aiperf/config/flags/_converter_dataset.py:798-805",
+     "src/aiperf/config/dataset/resolver.py:342-385 (_check_timing_data: top-level only), :148-161; src/aiperf/config/resolution/resolvers.py:369-409 (TimingResolver)",
+     "src/aiperf/config/flags/_converter_profiling.py:297-335 (auto-promotion only for trace types), :364-381 (fixed_schedule requests = line count), :423-450",
+     "src/aiperf/common/models/dataset_models.py:464-468",
+     "Run: verify_probe.py. With only turn-level timestamps, the RESOLVER raised the ValueError above. With a top-level timestamp, TimingResolver passed and requests=2 for 2 lines holding 4 dispatchable turns.",
+     "Run: verify_probe2.py. `--fixed-schedule --conversation-num 2` gave requests=2, sessions=2. `--fixed-schedule --benchmark-duration 30` gave requests=2. `--fixed-schedule --request-count 5` gave requests=5.",
+     "Run: MultiTurnDatasetLoader on the top-level-timestamp file gave system_message 'P' with turns [(None,0,None),(None,500,None)]."
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "7. Size limits or performance notes for large datasets (e.g. mmap dataset cache)",
+    "answer": "No explicit size limit was found.\n\nPipeline:\n1. The resolver makes a full pass over the file, JSON-parsing every line to count records and sessions (multi_turn).\n2. The loader parses it again.\n3. All Conversation objects are held in DatasetManager memory.\n4. They are streamed to `{AIPERF_DATASET_MMAP_BASE_PATH or tempdir}/aiperf_mmap_{benchmark_id}/dataset.dat` + `index.dat`.\n5. They are then freed from memory. Workers read from the mmap.\nThe persona is stored once per conversation, as system_message.\n\nThe content-addressed mmap cache (`~/.cache/aiperf/dataset_mmap`; `AIPERF_DATASET_MMAP_CACHE_ENABLED`, `AIPERF_DATASET_MMAP_CACHE_DIR`) covers only mooncake_trace, bailian_trace, burst_gpt_trace, sagemaker_data_capture, raw_payload, inputs_json, weka_trace and the weka public sets. multi_turn is rebuilt every run.\n\ninputs.json is always written for multi_turn. It holds one single-turn payload per dataset turn, each with the full persona system message and no history. It is serialized in memory with a single `orjson.dumps(..., OPT_INDENT_2)`, so its size is about total_turns × (persona + user text).\n\nOther notes:\n- `--uuid-and-strip` raises NotImplementedError for multi_turn.\n- `--export-level raw` adds _raw.jsonl request/response data.",
+    "evidence": [
+     "src/aiperf/config/dataset/resolver.py:164-170, :387-425",
+     "src/aiperf/dataset/loader/base_loader.py:154-191",
+     "src/aiperf/dataset/dataset_manager.py:250-257, :265-287, :300-330, :485-525, :752-760, :950-962",
+     "src/aiperf/dataset/payload_formatting.py:42-64 (turns=[turn] plus system_message per payload)",
+     "src/aiperf/dataset/mmap_cache.py:182-228",
+     "src/aiperf/common/environment.py:295-325",
+     "src/aiperf/dataset/loader/multi_turn.py:195-202",
+     "src/aiperf/common/enums/enums.py:297-303 (ExportLevel), CLI help --export-level"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "Supplement to 1/2: how conversation history accumulates (assistant turns = real server responses)",
+    "answer": "multi_turn has no loader-specific context mode, so a session uses `ConversationContextMode.DELTAS_WITHOUT_RESPONSES`. `advance_turn` appends each user turn to `turn_list`. After each response the worker calls `store_response(assistant_turn)` with the live reply. The next request then renders [system persona] + all prior user turns + all captured assistant replies + the new user turn.\n\nWhat the chat endpoint captures:\n- `content` only; `reasoning` is used as a fallback when content is empty.\n- tool_calls, when present.\n- Nothing (None) when the response has no text, e.g. an error or an empty body. In that case no assistant message is stored.",
+    "evidence": [
+     "src/aiperf/common/enums/enums.py:167-194",
+     "src/aiperf/dataset/loader/base_loader.py:92-98 (default None -> DELTAS_WITHOUT_RESPONSES)",
+     "src/aiperf/workers/session_manager.py:44-54, :99-163, :219-223",
+     "src/aiperf/workers/worker.py:1146-1160, :1451-1453",
+     "src/aiperf/endpoints/openai_chat.py:197-242, :327-342; src/aiperf/endpoints/base_endpoint.py:134-182",
+     "Run: session_probe.py. context_mode was deltas_without_responses and should_store was True. The T1 payload included the stored assistant 'A1'. `_build_assistant_turn_from_parsed([])` returned None."
+    ],
+    "confidence": "verified-by-run"
+   }
+  ],
+  "openIssues": [
+   "Fixed-schedule truncation at runtime (read-in-source, not run against a server). With --fixed-schedule the converter sets requests to the line count (verified), and each sent credit counts toward it (credit_counter.py:241-246 is_final_credit; issuer.py:465-469 sets all_credits_sent). A multi-turn schedule therefore stops sending once (number of lines) requests have gone out. Pass an explicit `--request-count` equal to the total number of dispatched turns (system turns excluded). --conversation-num and --benchmark-duration do NOT prevent this.",
+   "Fixed schedule as an arrival_rate implementation (inferred). Poisson session starts can be produced natively by writing Poisson-distributed first-user-turn `timestamp`s plus per-turn `delay` think times, a top-level `timestamp` on line 1, and --request-count = total turns. BasePhaseConfig accepts `concurrency` (phases.py:168), and the issuer's blocking acquire_session_slot means the cap would DELAY session starts rather than drop them. Drop counting has to stay in the wrapper; this was not run.",
+   "In --request-rate mode, continuation turns take rate ticks ahead of new sessions, and a tick with no free session slot is silently skipped (request_rate.py:190-232). There is no native 'Poisson session starts + max_concurrency + drop count' mode.",
+   "Errored or empty responses (read-in-source): no assistant message is stored (build_assistant_turn returns None), so the next turn's request has two user messages in a row. RequestRateStrategy.handle_credit_return ignores `error`, so the session continues. The wrapper's error-rate and history-length assumptions should allow for this.",
+   "Reasoning models: only `content` is threaded into history. If a server puts everything in `reasoning`/`reasoning_content` with empty content, the reasoning text is threaded as assistant content (base_endpoint.py:169-176). This inflates history compared with a real client.",
+   "Warmup: the 'warmup\\n' system prefix (or a plain 'warmup' system message when there is no persona) means warmup never primes the profiling prefix cache. Warmup also consumes sessions from the shared sequential sampler (at least sessions started + 1 because of the pre-sample).",
+   "`--tokenizer builtin` is described as 'zero-network-access', but tiktoken downloads o200k_base on first use unless it is already cached (tokenizer.py:237-265; docs/reference/tokenizer-auto-detection.md:24). Pre-seed TIKTOKEN_CACHE_DIR for air-gapped runs. Loading a local tokenizer directory path was not exercised.",
+   "Not verified by a live run: what the actual HF-load failure looks like for an unresolvable model name under --use-server-token-count without --tokenizer. Source plus tok_probe show the raw model name reaches Tokenizer.from_pretrained with resolve_alias=True.",
+   "Probes (offline, no server, nothing installed): scratchpad/topic-dataset-format/verify_probe.py, verify_probe2.py, tok_probe.py, session_probe.py, run with the pre-existing scratchpad/aiperf-venv (aiperf 0.12.0). They monkeypatch aiperf.cli_runner.run_benchmark to capture the BenchmarkPlan and run only DatasetResolver and TimingResolver."
+  ],
+  "corrections": [
+   {
+    "question": "6. timestamp semantics for fixed schedule",
+    "before": "multi_turn is not a trace type, so it is never auto-promoted: pass `--fixed-schedule`.",
+    "after": "Passing `--fixed-schedule` alone FAILS config resolution for multi_turn unless the first JSONL line has a top-level `timestamp` or `delay` key. The resolver checks only top-level keys of record 1, so per-turn timestamps do not count. Add e.g. `\"timestamp\": 0` at the top level of line 1; MultiTurn ignores it via extra=allow.",
+    "reason": "resolver.py:342-385 (_check_timing_data reads record.get('timestamp'/'delay') at top level) and resolvers.py:390-409 raise a ValueError. Reproduced by verify_probe.py."
+   },
+   {
+    "question": "Open issue: fixed-schedule requests default",
+    "before": "Inferred, not run: ... requests = number of non-empty JSONL lines ... Pass --request-count or --conversation-num explicitly.",
+    "after": "Verified by run: requests = number of lines even when --conversation-num or --benchmark-duration is set (the converter only checks `\"requests\" not in prof`). Only an explicit --request-count overrides it. The runtime truncation remains read-in-source.",
+    "reason": "_converter_profiling.py:373-381. verify_probe2.py showed fixed+convnum requests=2, fixed+duration requests=2, fixed+reqcount requests=5."
+   },
+   {
+    "question": "4. --tokenizer default / placeholder fallback",
+    "before": "If the model name looks like a placeholder (mock, test, fake, etc.), `builtin` is used automatically.",
+    "after": "The automatic builtin switch does NOT happen under `--use-server-token-count` with a file dataset, which is the recommended combination. validate_tokenizer_early returns before the placeholder logic, and DatasetManager then loads the raw model name from the HF Hub. Always pass --tokenizer explicitly.",
+    "reason": "tokenizer_validator.py:249-254 returns before :275-293. tok_probe.py: server-count validator returned None and the tokenizer name stayed None, so 'mock-model' would be loaded."
+   },
+   {
+    "question": "1. evidence line refs",
+    "before": "src/aiperf/config/flags/cli_config.py:510-521 (--input-file); src/aiperf/dataset/loader/base_loader.py:176-186",
+    "after": "cli_config.py:520-532 (--input-file); base_loader.py:182-191 (orjson per non-empty line, inside _iter_record_dicts at :154-191)",
+    "reason": "Line numbers checked in the v0.12.0 clone. 510-518 is the --header field."
+   },
+   {
+    "question": "5. evidence line refs",
+    "before": "src/aiperf/config/dataset/resolver.py:427-441,487-500 (_get_preferred_sampling/_resolve_sampling); cli_config.py:668-676 (allow_dataset_wrap)",
+    "after": "resolver.py:237-249 (_resolve_sampling), :427-441 (_get_preferred_sampling); cli_config.py:668-682 (allow_dataset_wrap)",
+    "reason": "resolver.py:487-500 is _collect_turn_refs (DAG), not sampling."
+   },
+   {
+    "question": "5. --conversation-num scope",
+    "before": "`--conversation-num` stops starting new sessions but lets started sessions finish (implicitly supported for multi_turn).",
+    "after": "Confirmed for multi_turn: it maps to phases.profiling.sessions, even though the CLI help says 'Supported on synthetic mode and the custom random_pool dataset'. It also sets FileDataset.entries, which is used only by random_pool and does not truncate multi_turn.",
+    "reason": "verify_probe.py showed conv-num gives sessions=5, entries=5; custom.py:308-317 is the only consumer of entries for file datasets."
+   },
+   {
+    "question": "2. warmup system message",
+    "before": "During WARMUP only, the worker changes the system message to \"warmup\\n\" + persona (unless cache-bust is active).",
+    "after": "The same, plus: a conversation with NO system_message gets the system message \"warmup\" during warmup.",
+    "reason": "worker.py:1367-1368 (`if not system_message: return WARMUP_SYSTEM_MESSAGE_PREFIX`)."
+   },
+   {
+    "question": "3. --extra-inputs coercion",
+    "before": "x.y becomes float (implying numeric strings are generally coerced).",
+    "after": "Only plain ints (optionally negative, no leading zero) and values with exactly one '.' become numbers. Scientific notation such as `1e-5` stays a string, and commas always split pairs. Use the JSON-object form for such values, lists and nested dicts.",
+    "reason": "parsing.py:149-170 and :198-207."
+   },
+   {
+    "question": "6. --inter-turn-delay-cap-seconds scope",
+    "before": "`--inter-turn-delay-cap-seconds` clamps multi_turn delays.",
+    "after": "Correct in source, although the CLI help and FileDataset docs name only the DAG JSONL and baseten_trace loaders. multi_turn reads the same FileDataset field (multi_turn.py:136-142), and the converter routes it for FILE datasets (_converter_dataset.py:798-805).",
+    "reason": "Help text (config.py:395-405) contradicts the loader code; the code is what runs."
+   },
+   {
+    "question": "1. which turns become requests",
+    "before": "(not stated)",
+    "after": "Every turn that is not hoisted becomes its own request, including authored role=assistant turns. multi_turn cannot pre-seed assistant history; the history consists of live responses captured through DELTAS_WITHOUT_RESPONSES.",
+    "reason": "multi_turn.py:211-219 appends every non-hoisted turn; session_manager.py:151-163; session_probe.py."
+   }
+  ]
+ },
+ {
+  "topic": "AIPerf v0.12.0 load/timing modes and phases for the multi-turn persona chat wrapper (adversarially re-verified)",
+  "facts": [
+   {
+    "question": "1. With --concurrency and a multi_turn custom dataset, does it count concurrent sessions or in-flight requests? Is a new session started as soon as one finishes?",
+    "answer": "It counts SESSIONS. A session slot is taken on turn 0 (turn_index==0 or is_session_start, agent_depth==0). It is released only when the root's final turn returns (credit.is_final_turn), or at phase end for sessions still in flight. Think time does not release the slot. Think time is `delay` (ms) on turns[i]; it becomes delay_ms and is applied with schedule_later() after the previous turn's response has FULLY returned, so it is measured from response end, not request start. A new session starts about 0.6 ms after a final turn returns. Prior smoke run1 (--concurrency 2, sessions A/B/C with 3 turns each and delay 500): B's turn 0 ended at 562.2 ms and its turn 1 was issued at 1062.6 ms. B's final turn ended at 3045.5 ms and session C started at 3046.1 ms. While both sessions sat in think time, no third session started. So in-flight HTTP requests are at most N and usually fewer.",
+    "evidence": [
+     "scratchpad/smoke/run1.sh (aiperf profile ... --custom-dataset-type multi_turn --concurrency 2) + run1/profile_export.jsonl sorted by credit_issued_ns: sess-A t0 0.0->665.3, sess-B t0 0.1->562.2, sess-B t1 issued 1062.6, sess-B t2 ended 3045.5, sess-C t0 issued 3046.1",
+     "src/aiperf/timing/concurrency.py:392-403 (session slot acquired on first turn, released on final turn or phase cleanup)",
+     "src/aiperf/credit/issuer.py:263-351 (issue_credit; needs_session_slot = is_session_start and not is_child at :324)",
+     "src/aiperf/credit/callback_handler.py:620-638 (release on is_final_turn and agent_depth==0; phase-end release of in_flight_sessions)",
+     "src/aiperf/timing/strategies/request_rate.py:272-279 (delay_ms -> schedule_later, then queue continuation)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1. (mechanics) Loop, prefill slot, workers, doc wording",
+    "answer": "With --concurrency and no rate flag, phase type=CONCURRENCY, timing mode=REQUEST_RATE, arrival pattern=CONCURRENCY_BURST (next_interval 0.0). Each loop pass does ONE action. If a continuation is queued, it issues that continuation with a blocking issue_credit. Otherwise, if can_start_new_session(), it calls try_issue_credit on the pre-sampled first turn; a None result (no slot) just yields. Continuation turns only need a prefill slot. The prefill limit is off unless --prefill-concurrency is set; that flag needs endpoint streaming (verified: it raises 'prefill_concurrency requires endpoint.streaming=true') and must be <= concurrency. The worker count is capped at the largest profiling-phase concurrency. The CLI help ('Number of concurrent requests to maintain... in-flight requests') and the YAML field doc ('Max concurrent in-flight requests') are wrong. docs/benchmark-modes/timing-modes-reference.md ('Limits concurrent sessions') is correct. Inferred: when every session is in think time, the loop hot-spins on yield_to_event_loop() in the TimingManager process.",
+    "evidence": [
+     "src/aiperf/config/flags/_converter_profiling.py:83-110 (no rate -> PhaseType.CONCURRENCY)",
+     "src/aiperf/timing/config.py:42-49 (CONCURRENCY -> CONCURRENCY_BURST), :52-60 (REQUEST_RATE timing mode)",
+     "src/aiperf/timing/intervals.py:207-233 (ConcurrencyBurst next_interval returns 0.0)",
+     "src/aiperf/timing/strategies/request_rate.py:146-147,186-232",
+     "src/aiperf/common/utils.py:117-125 (yield_to_event_loop, no sleep)",
+     "src/aiperf/config/config.py:516-519 (prefill requires streaming); src/aiperf/config/phases.py:449-456 (prefill <= concurrency)",
+     "src/aiperf/workers/worker_manager.py:80-85,93-109",
+     "src/aiperf/config/flags/cli_config.py:1951-1966; src/aiperf/config/phases.py:168-177; docs/benchmark-modes/timing-modes-reference.md:76",
+     "python convert_cli_to_aiperf(CLIConfig(concurrency=4, prefill_concurrency=2, streaming=False, ...)) -> ValidationError 'prefill_concurrency requires endpoint.streaming=true'"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "1. (errors) Does an errored turn end the session?",
+    "answer": "No. RequestRateStrategy.handle_credit_return ignores `error` and still queues the next turn after its delay. Prior smoke run4 (mock returning 500s): sess-A turn 0 failed with 'Internal Server Error' at 2.2 ms, and sess-A turn 1 was still issued at 518.3 ms. The wrapper's error_rate counts per-turn failures, and later turns of that session keep running.",
+    "evidence": [
+     "scratchpad/smoke/run4.sh + run4/profile_export.jsonl: sess-A t0 error type 'Internal Server Error' end 2.2ms; sess-A t1 issued 518.3ms",
+     "src/aiperf/timing/strategies/request_rate.py:234-279 (error accepted for protocol parity and ignored)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "2. Duration control: flags/defaults and stop-condition conversion",
+    "answer": "`--benchmark-duration <sec>` is a float; a comma list turns it into a sweep. `--benchmark-grace-period <sec>` is a float >= 0 with default 30.0 and accepts inf. The converter injects grace_period=30.0 only when a duration is set. Passing --benchmark-grace-period without --benchmark-duration raises 'ValueError: --benchmark-grace-period requires --benchmark-duration to be set...'. YAML keys are phase `duration` (300, '5m', '2h') and `grace_period` (camelCase `gracePeriod` also loads). In YAML, grace_period has NO default (None). If a CLI run has no requests, duration or sessions, the converter sets requests=10. Prior run1 had no stop flag and sent exactly 10 requests, cutting a second pass of sess-A after its turn 1. `--num-sessions` (aliases `--conversation-num`, `--num-conversations`) stops STARTING sessions after N and lets started sessions finish every turn: run1e with --conversation-num 3 sent 9 = 3x3 requests. `--request-count` (alias `--num-requests`) caps turns on the wire. --request-count and --num-sessions are NOT mutually exclusive, despite the docs; both land in the phase.",
+    "evidence": [
+     "python convert_cli_to_aiperf(CLIConfig(concurrency=4, benchmark_duration=60,...)) -> profiling {type: CONCURRENCY, concurrency: 4, duration: 60.0, grace_period: 30.0}",
+     "same with only concurrency=4 -> {requests: 10}; with benchmark_grace_period=5 and no duration -> ValueError; benchmark_grace_period=inf -> grace_period inf; request_count=20 + conversation_num=5 -> {requests: 20, sessions: 7→5 both kept}",
+     "scratchpad/smoke/run1 (10 records, last = sess-A turn_index 1) and run1e (9 records, 3 full sessions)",
+     "src/aiperf/config/flags/cli_config.py:1921-1949, 829-847, 2032-2049",
+     "src/aiperf/config/flags/_converter_profiling.py:463-489, 271-279",
+     "src/aiperf/config/phases.py:146-153, 211-219, 457-460",
+     "src/aiperf/timing/phase/stop_conditions.py:152-193",
+     "docs/benchmark-modes/timing-modes-reference.md:55-56 (claims mutual exclusion)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "2. Fate of in-flight requests and mid-conversation sessions at stage end",
+    "answer": "Deadlines are measured from phase start. At `duration`, DurationStopCondition makes can_send_any_turn() False. The runner cancels the strategy task, calls mark_sending_complete and scheduler.cancel_all_pending(), which drops continuations still in think-time timers. The callback handler stops queuing next turns. Requests already in flight may finish until duration+grace, and are counted. Grace None counts as 0 (grace_period_sec or 0), so a YAML profiling phase without grace_period cancels in-flight requests right at the duration. After the grace timeout: cancel_all_credits(); a wait of AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT (default 10.0 s); then stuck slots are force-released. Cancelled credits emit NO record: the transport builds an error record for code 499 and then re-raises CancelledError, so the record is never sent. They are therefore neither errors nor successes. The only trace is the WARNING log 'Phase ... timed out, cancelling all credits. Stats: sent=..., completed=..., cancelled=..., in_flight=...'. Completed turns of sessions that were cut off keep their records. No option lets sessions finish under duration; use `sessions` as the stop condition instead.",
+    "evidence": [
+     "src/aiperf/timing/phase/lifecycle.py:131-156",
+     "src/aiperf/timing/phase/stop_conditions.py:196-207",
+     "src/aiperf/timing/phase/runner.py:961-999 (cancel_all_pending at :988)",
+     "src/aiperf/timing/phase/runner.py:1001-1124 (warning ~:1057-1066, cancel_all_credits :1068, CANCEL_DRAIN_TIMEOUT :1088, _release_stuck_slots)",
+     "src/aiperf/timing/config.py:683 (grace_period_sec=phase.grace_period, no default)",
+     "src/aiperf/credit/callback_handler.py:501-509",
+     "src/aiperf/workers/worker.py:824-850; src/aiperf/transports/aiohttp_client.py:286-297 (record built then CancelledError re-raised)",
+     "src/aiperf/common/environment.py:1155-1160; docs/environment-variables.md:289"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "3. Warmup: flags and conversion",
+    "answer": "A warmup phase exists only if a trigger is set: `--warmup-request-count` (alias `--num-warmup-requests`), `--warmup-duration`, or `--num-warmup-sessions`. Every trigger that is set is applied (AND-combined stop conditions; the first to fire ends warmup). Verified: request_count=5 + num_sessions=2 gives a warmup with {requests: 5, sessions: 2}, so the docs' 'mutually exclusive' claim is false. Modifiers: --warmup-concurrency, --warmup-request-rate, --warmup-arrival-pattern, --warmup-prefill-concurrency, --warmup-concurrency-ramp-duration, --warmup-prefill-concurrency-ramp-duration, --warmup-request-rate-ramp-duration. Each falls back to its profiling counterpart. If --concurrency is a list: with no rate, warmup becomes type concurrency with concurrency 1 (verified: `--concurrency 10,20 --warmup-duration 10` -> warmup {CONCURRENCY, concurrency 1, duration 10}); with a rate, warmup gets no concurrency cap. --warmup-grace-period has no default, which means inf in timing, and it is rejected unless --warmup-duration is set (verified error). The warmup timing mode is always REQUEST_RATE.",
+    "evidence": [
+     "python convert_cli_to_aiperf cases: 'warmup req+sessions' -> {requests:5, sessions:2}; 'warmup dur + conc list' -> warmup concurrency 1, sweep=yes; 'warmup req + wgrace' -> ValueError '--warmup-grace-period requires --warmup-duration'",
+     "src/aiperf/config/flags/cli_config.py:2247-2425",
+     "src/aiperf/config/flags/_converter_warmup.py:22-34, 37-76, 109-172",
+     "src/aiperf/timing/config.py:523-571 (REQUEST_RATE at :554, grace None -> inf at :541-543)",
+     "aiperf profile --help Warmup group (scratchpad/verify-timing-help.txt:714-773)",
+     "docs/benchmark-modes/timing-modes-reference.md:127-143"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "3. Warmup: metric exclusion and dataset-session consumption",
+    "answer": "Every record carries metadata.benchmark_phase ('warmup'/'profiling'), phase_index, profiling_index, phase_name and phase_kind (all present in the smoke JSONL). Aggregates are masked by that tag, and kind=warmup is forced to exclude_from_results=True. profile_export.jsonl has no phase filter (inferred), so the wrapper must filter on metadata.benchmark_phase or phase_kind. All phases share one sampler and ConversationSource. File datasets default to SEQUENTIAL sampling, which wraps: run1 went A,B,C,A. Warmup therefore consumes sessions from the start of the file. CORRECTION: each REQUEST_RATE phase pre-samples the next session's first turn (request_rate.py:146-147, re-sampled after every successful start). The sample held when the phase ends is discarded, so the next phase skips one conversation (inferred; run1 ends with B pre-sampled but unsent). Warmup sessions cut off mid-conversation are not resumed, because each phase gets a new strategy and queue. --warmup-request-count and --warmup-duration cut sessions mid-conversation; --num-warmup-sessions runs started sessions to completion, think time included. When a run has more than one concrete phase, phases/<name>/ output is written for warmup phases too, including a plain CLI warmup+profiling run (read-in-source).",
+    "evidence": [
+     "scratchpad/smoke/run1/profile_export.jsonl metadata keys: agent_depth, benchmark_phase, conversation_id, credit_issued_ns, phase_index, phase_kind, phase_name, profiling_index, request_start_ns, request_end_ns, session_num, turn_index, was_cancelled, x_correlation_id, ...",
+     "src/aiperf/common/models/record_models.py:218-262",
+     "src/aiperf/metrics/accumulator.py:241-275",
+     "src/aiperf/config/phases.py:415-438",
+     "src/aiperf/post_processors/record_export_jsonl_writer.py:66-92; src/aiperf/records/records_manager.py:720-760 (records dispatched regardless of phase)",
+     "src/aiperf/timing/phase_orchestrator.py:115-135,181-184,263-280",
+     "src/aiperf/timing/conversation_source.py:182-191 (next() consumes the sampler)",
+     "src/aiperf/timing/strategies/request_rate.py:146-147,207-211",
+     "src/aiperf/dataset/dataset_samplers.py:46-86; src/aiperf/config/dataset/config.py:340-348; src/aiperf/dataset/loader/multi_turn.py:162-165",
+     "src/aiperf/records/records_manager.py:1535-1604 (_iter_concrete_phase_stats(None) includes warmup; per-phase results when >1 concrete phase)"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "4. Multiple stages in one invocation: YAML multi-phase (validated)",
+    "answer": "The proposed YAML was run through aiperf.config.loader.core.load_config() with installed aiperf 0.12.0 and validated as AIPerfConfig: `schemaVersion: \"2.0\"`, `benchmark:` with `model`, `endpoint: {url, type: chat, streaming: true}`, `dataset: {type: file, path, format: multi_turn}`, a `phases:` list of {name, kind, type: concurrency, concurrency, duration[, grace_period]}, and `artifacts: {dir}`. Parsed: warm_c10 warmup exclude_from_results=True grace None; stage_c10 profiling grace 60.0; seamless False. The dataset resolved to name 'default' with sampling=SEQUENTIAL. Rules: names match ^[A-Za-z_][A-Za-z0-9_-]*$ and must be unique case-insensitively; non-canonical names need `kind`; at least one profiling phase; each non-fixed_schedule phase needs requests, duration or sessions; a single dict under `phases:` is rejected. PhaseType values: concurrency, constant, gamma, poisson, fixed_schedule, user_centric, agentic_replay. NEW footgun: with more than one profiling phase in the YAML, CLI load-gen flags (e.g. --concurrency, --benchmark-duration) raise ConfigurationError ('CLI loadgen flags target the profiling phase, but this config has N profiling phases'). All stage parameters must therefore live in the YAML; runtime flags such as --ui none are fine.",
+    "evidence": [
+     "scratchpad/verify-timing/stages.yaml + `aiperf-venv/bin/python -c load_config('stages.yaml')` -> AIPerfConfig; phases printed: warm_c10 warmup concurrency 10 60.0 None True False / stage_c10 profiling concurrency 10 300.0 60.0 False False / ...; FileDataset(... format=MULTI_TURN, sampling=SEQUENTIAL)",
+     "aiperf-venv python: [p.value for p in PhaseType] -> ['concurrency','constant','gamma','poisson','fixed_schedule','user_centric','agentic_replay']",
+     "src/aiperf/config/phases.py:68-461",
+     "src/aiperf/config/config.py:116-130, 464-479",
+     "src/aiperf/config/flags/resolver.py:455-490, 522-549",
+     "src/aiperf/config/templates/multi_turn_conversation.yaml"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "4. Multiple stages: sweeps, output layout, per-stage warmup, limits",
+    "answer": "(a) CLI comma lists (--concurrency, --request-rate, --benchmark-duration, --num-sessions, ...) form a grid sweep; `--sweep-type zip` pairs them instead. Each variation runs as a separate subprocess (`python -u -m aiperf.orchestrator.subprocess_runner <cfg>`) into `<artifact-dir>/<leaf>_<value>/`, e.g. concurrency_10. Each variation runs its own warmup on its first trial. Sweeps are rejected with fixed_schedule, including trace auto-promotion, and a dashboard UI is rejected. (b) YAML multi-phase output: root profile_export_aiperf.json/.csv aggregates ALL profiling phases. benchmark_duration, request_throughput, input/output/total token throughput and goodput are recomputed over the sum of (requests_end_ns - start_ns) across phases. When there is more than one concrete phase (warmups included), phases/<phase_name>/profile_export_aiperf.json and .csv are written by the SAME MetricsJsonExporter/MetricsCsvExporter classes, so they carry the same stat keys (run1 root stats: avg,count,max,min,p1,p5,p10,p25,p50,p75,p90,p95,p99,std,sum,unit), plus server_metrics.json and gpu_telemetry.json when available. phase_manifest.json holds {schema_version: 1, phases: [{phase_index, profiling_index, phase_name, phase_kind, start_ns, end_ns, was_cancelled, successful_request_count, error_request_count, total_request_count, error_summary, metrics_json, metrics_csv, [server_metrics_json], [gpu_telemetry_json]}]}. By default a phase waits for the previous one to drain; `seamless: true` skips the wait. Limits: one dataset, and one sampler shared by all phases. Every fixed_schedule phase replays the WHOLE dataset, including sessions a preceding warmup already sent, which pre-warms the prefix cache (inferred). Trace offsets are read from the first phase that sets them. The worker count is sized by the MAX concurrency across profiling phases. Recommendation stands: concurrency stages in one YAML; fixed_schedule arrival-rate stages as one process per stage, each with its own distinct session file.",
+    "evidence": [
+     "src/aiperf/orchestrator/local_executor.py:1-6,144-158",
+     "src/aiperf/orchestrator/orchestrator.py:35-100 (layout table), 596-660 (per-variation warmup history)",
+     "src/aiperf/orchestrator/strategies.py:163-227,289-304",
+     "src/aiperf/config/sweep/config.py:682-702",
+     "src/aiperf/config/flags/_converter_profiling.py:254-269",
+     "src/aiperf/cli_runner/_multi_run.py:199-203; src/aiperf/config/config.py:891-910",
+     "src/aiperf/exporters/exporter_manager.py:120-194,279-298",
+     "src/aiperf/records/records_manager.py:1462-1499,1535-1604",
+     "scratchpad/smoke/run1/profile_export_aiperf.json time_to_first_token keys",
+     "src/aiperf/timing/strategies/fixed_schedule.py:76-117",
+     "src/aiperf/dataset/loader/base_trace_loader.py:108-121",
+     "src/aiperf/workers/worker_manager.py:93-109"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "5. --fixed-schedule with multi_turn: empirical behavior",
+    "answer": "multi_turn with timing only inside turns[] FAILS at config resolution with: 'Configuration resolution failed: Phase 'profiling' uses fixed_schedule which requires timestamp or delay fields in the dataset, but dataset 'main' has no timing data in its first record'. Adding a TOP-LEVEL `timestamp` to each JSONL record (MultiTurn is extra='allow') WORKS; this was verified by a prior smoke run. Records looked like {session_id, timestamp: 0|100|200, turns: [..., {..., timestamp: <same>}, {..., delay: 500}, {..., delay: 500}]} with --fixed-schedule --concurrency 1. Observed: sess-B turn 0, scheduled at 100 ms, was QUEUED behind the session cap and fired at 3391.5 ms, right after sess-A's final turn ended at 3391.0. It was not dropped. Later turns fired about 500 ms after the previous response END (666.9 -> 1167.6). Converter: auto_offset defaults to True when --fixed-schedule-auto-offset is not given, even though CLI help shows [default: False]. It becomes False when --fixed-schedule-start-offset is given; auto+start raises 'auto_offset cannot be True when start_offset is set'. The CLI converter sets requests = number of JSONL lines (3 = sessions for multi_turn), but PhaseRunner overrides this with metadata.total_turn_count: all 9 turns were sent.",
+    "evidence": [
+     "scratchpad/smoke/run2_attempt1_nested_ts_only.log (exact error text above)",
+     "scratchpad/smoke/run2.sh (--custom-dataset-type multi_turn --fixed-schedule --concurrency 1 --input-file dataset_fixed_toplevel.jsonl) + run2/profile_export.jsonl: sess-A t0 0.0->666.9, t1 1167.6, t2 2488.5->3391.0; sess-B t0 issued 3391.5; 9 records",
+     "python convert_cli_to_aiperf(CLIConfig(fixed_schedule=True, concurrency=2, input_file=fixed.jsonl, custom_dataset_type='multi_turn')) -> {type: FIXED_SCHEDULE, concurrency: 2, requests: 3, auto_offset: True}; with fixed_schedule_start_offset=0 -> auto_offset False; with both -> ValidationError",
+     "src/aiperf/timing/phase/runner.py:139-149 (total_expected_requests = metadata.total_turn_count)",
+     "src/aiperf/config/flags/_converter_profiling.py:373-381,477-478",
+     "src/aiperf/config/phases.py:652-703",
+     "src/aiperf/config/dataset/resolver.py:342-385; src/aiperf/config/resolution/resolvers.py:390-408"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "5. --fixed-schedule: flags and scheduling semantics (source)",
+    "answer": "Flags: --fixed-schedule, --no-fixed-schedule (suppresses trace auto-promotion), --fixed-schedule-auto-offset, --fixed-schedule-start-offset <ms>, --fixed-schedule-end-offset <ms>. The offset flags error without --fixed-schedule, and start must be <= end. Schedule zero = the minimum first-turn timestamp when auto_offset; else start_offset; else 0. turns[0].timestamp_ms is required, otherwise 'First turn of <id> missing timestamp_ms'. Conversations are sorted by timestamp and each is replayed exactly once, with no sampling and no wrap; fixed_schedule requires sequential sampling. The phase ends after the dataset's total turn count, or at --benchmark-duration if that comes first. Next turn: `timestamp` gives an absolute time from the schedule zero; `delay` gives delay ms after the previous turn's credit return; neither means immediate. If both are present, timestamp wins. The SingleTurn validator is truthiness-based (`if self.timestamp and self.delay`), so timestamp=0 together with delay passes validation. Concurrency cap: first turns AWAIT the session semaphore. Nothing is dropped and nothing is exported for it; only ConcurrencyStats.wait_count, which is internal. After the duration ends, a waiting first turn fails the stop check and is never sent. Lateness must be computed by the wrapper: metadata.credit_issued_ns (wall-clock time.time_ns, taken after the slot is acquired) for turn_index 0, compared with phase start + (timestamp - zero). Inferred: the schedule uses turns[0].timestamp and the top-level key only satisfies the resolver check; in the smoke dataset both were equal. The mooncake_trace alternative (one line per turn, grouped by session_id, text_input) falls back to DELTAS_WITHOUT_RESPONSES (live responses threaded into history). multi_turn is not a trace dataset (plugins.is_trace_dataset('multi_turn') == False), so it never auto-promotes.",
+    "evidence": [
+     "src/aiperf/config/flags/cli_config.py:732-800",
+     "src/aiperf/timing/strategies/fixed_schedule.py:76-178",
+     "src/aiperf/dataset/loader/models.py:97-134 (truthiness check at :132), 167-190",
+     "src/aiperf/config/config.py:525-541 (fixed_schedule needs sequential)",
+     "src/aiperf/credit/issuer.py:263-351; src/aiperf/timing/concurrency.py:24-38,144-153,445-463",
+     "src/aiperf/common/models/record_models.py:218-222 (credit_issued_ns is wall clock)",
+     "src/aiperf/dataset/loader/mooncake_trace.py:79-107; src/aiperf/dataset/loader/base_loader.py:92-96; src/aiperf/common/enums/enums.py:167-192",
+     "aiperf-venv python: plugins.is_trace_dataset('multi_turn') -> False, ('mooncake_trace') -> True",
+     "tests/component_integration/timing/test_fixed_schedule.py:60-161"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "6. Request-rate and arrival-pattern flags and their semantics with multi-turn",
+    "answer": "Flags: `--request-rate R` (float, list = sweep); `--arrival-pattern` (alias `--request-rate-mode`; the help lists choices concurrency-burst, constant, gamma, poisson; default poisson); `--arrival-smoothness` (alias `--vllm-burstiness`), where smoothness alone auto-selects GAMMA (verified); `--request-rate-ramp-duration`; `--request-rate-series` (mutually exclusive with --request-rate). Conversion: --request-rate 5 --concurrency 3 gives type POISSON, rate 5.0, concurrency 3 (verified); with no --concurrency, sessions are unlimited. Semantics: each tick issues ONE credit for ANY turn. A queued continuation has priority; otherwise a new session is started. A continuation waits its delay, then the next tick, so effective think time = delay + tick wait. Prior run3 (rate 20, poisson, --concurrency 1, 3 sessions): sess-A turn 0 ended at 670.2 ms and turn 1 was issued at 1272.9 ms, i.e. 500 ms delay plus about 103 ms tick wait. sess-B started only after sess-A's final turn, because --concurrency caps SESSIONS. At the cap, the new-session attempt is skipped (try_issue_credit returns None) and that tick is lost. The pre-sampled conversation is KEPT for the next tick, and nothing is queued or counted. The docs' 'blocked' wording is wrong for rate mode. Rate mode therefore does not produce Poisson session starts. User-centric mode (--user-centric-rate + --num-users) uses turn_gap = num_users/rate and ignores dataset `delay`. It also fails with a custom multi_turn file unless --session-turns-mean >= 2 is passed (verified error). For arrival_rate, fixed_schedule stays the right fit: Poisson timestamps on turn 0, `delay` on later turns, --concurrency as the cap, and drops or lateness computed afterwards.",
+    "evidence": [
+     "scratchpad/smoke/run3.sh (--request-rate 20 --arrival-pattern poisson --concurrency 1 --conversation-num 3) + run3/profile_export.jsonl: A t0 end 670.2, A t1 issued 1272.9, A t2 end 3530.1, B t0 issued 3592.6",
+     "python convert_cli_to_aiperf: rate+cap -> {POISSON, concurrency 3, rate 5.0}; smoothness only -> {GAMMA, smoothness 0.5}; user-centric -> ValueError 'User-centric rate mode requires --session-turns-mean >= 2'",
+     "src/aiperf/config/flags/cli_config.py:1983-2099",
+     "src/aiperf/config/flags/_converter_profiling.py:83-135,235-250",
+     "src/aiperf/timing/strategies/request_rate.py:128-232 (None case keeps next_new_session_turn), 234-279",
+     "src/aiperf/credit/issuer.py:353-401",
+     "src/aiperf/timing/strategies/user_centric_rate.py:1-60,144-161 (no delay_ms use)",
+     "docs/benchmark-modes/timing-modes-reference.md:79-82"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "7. SIGINT/Ctrl+C behavior and whether partial results are exported",
+    "answer": "A single run hosts the SystemController in the main process (bootstrap_and_run_service in-process), and it installs the only SIGINT handler (loop.add_signal_handler). Child services set SIGINT and SIGTERM to SIG_IGN and carry a parent-death guard. First SIGINT: a stderr panel 'BENCHMARK CANCELLED ... Results will be written to files.', then a ProfileCancelCommand broadcast. The timing side calls cancel_all_credits (cancelled in-flight requests emit no record). The controller waits up to AIPERF_SERVICE_PROFILE_CANCEL_TIMEOUT (10.0 s) for the RecordsManager's ProcessRecordsResult and then exports normally. The JSON gets top-level `was_cancelled: true` (the key exists; false in normal runs), and the console notes the run was cancelled early. Exit code is os._exit(1 if _exit_errors else 0), so 0 after a clean graceful cancel. Second SIGINT: force quit (_kill); results may be missing. The main process has no SIGTERM handler, so SIGTERM kills it without export (inferred). Send SIGINT to the aiperf PID. SIGUSR1 dumps stacks. CORRECTION for sweeps: the v0.12.0 CLI never passes cancel_check to MultiRunOrchestrator.execute, and the parent runs subprocess.run inside asyncio.to_thread. A SIGINT sent only to the parent PID therefore does not reach the running variation subprocess (inferred). Send it to the process group, or avoid CLI sweeps.",
+    "evidence": [
+     "src/aiperf/controller/system_mixins.py:20-83",
+     "src/aiperf/controller/system_controller.py:240, 832-960, 1040-1084 (os._exit at :1084), 1183-1185",
+     "src/aiperf/cli_runner/_single_run.py:78-84 (SystemController run in-process)",
+     "src/aiperf/common/bootstrap.py:99-115",
+     "src/aiperf/timing/phase_orchestrator.py:316-327",
+     "src/aiperf/common/environment.py:1239-1244",
+     "scratchpad/smoke/run1/profile_export_aiperf.json top-level key was_cancelled=False",
+     "src/aiperf/cli_runner/_multi_run.py:149-157 (execute(plan, executor, search_planner=...) without cancel_check); src/aiperf/orchestrator/local_executor.py:44,144-158"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "8. Client capacity: worker knobs, high-load CPU warning conditions, max-throughput guidance",
+    "answer": "`--workers-max` (alias `--max-workers`). The default is max(1, min(int(cpu_count*AIPERF_WORKER_CPU_UTILIZATION_FACTOR[0.75]) - 1, AIPERF_WORKER_MAX_WORKERS_CAP[32])). It is then capped at the max `concurrency` across PROFILING phases whenever one is set (any phase type, including a rate cap), and floored at runtime.workers_min, which is YAML-only with no CLI flag. An explicit --workers-max ignores the 32 cap but is still concurrency-capped. `--record-processor-service-count` (alias `--record-processors`) defaults to max(1, workers // AIPERF_RECORD_PROCESSOR_SCALE_FACTOR[4]). High-load warning: workers report cpu_percent every AIPERF_WORKER_HEALTH_CHECK_INTERVAL (2.0 s). Above AIPERF_WORKER_HIGH_LOAD_CPU_USAGE (85.0), WorkerManager logs 'CPU usage for <id> is N%. AIPerf results may be inaccurate.' and sets HIGH_LOAD, which lasts 5.0 s (AIPERF_WORKER_HIGH_LOAD_RECOVERY_TIME). Nuance: the check is an elif after the ERROR branch, so the warning is suppressed while a worker had a failed task within AIPERF_WORKER_ERROR_RECOVERY_TIME (3.0 s). AIPERF_HTTP_CONNECTION_LIMIT defaults to 2500 connections per worker client. There is no documented max-throughput figure.",
+    "evidence": [
+     "aiperf profile --help: '--workers-max --max-workers ... min(concurrency, (num CPUs * 0.75) - 1), with a default max cap of 32' (scratchpad/verify-timing-help.txt:1420-1426); '--record-processor-service-count --record-processors' (:1339-1344)",
+     "src/aiperf/config/flags/cli_config.py:4037,4101",
+     "src/aiperf/workers/worker_manager.py:60-109, 141-170",
+     "src/aiperf/common/environment.py:1531-1567 (0.75, 3.0, 2.0, 85.0, 5.0, 32), 947-950 (4), 681-685 (2500)",
+     "src/aiperf/controller/system_controller.py:115-124,598-603",
+     "docs/environment-variables.md:140,331-333"
+    ],
+    "confidence": "read-in-source"
+   }
+  ],
+  "openIssues": [
+   "I ran no new aiperf profile runs. The empirical evidence comes from (a) CLI-to-config conversions and a YAML load_config() that I ran with the installed aiperf 0.12.0 (scratchpad/verify-timing), and (b) artifacts already in scratchpad/smoke (run1, run1e, run2, run3, run4 against a local mock server). I read those runs' command lines and outputs but did not produce them myself.",
+   "That profile_export.jsonl contains warmup records is still inferred: no smoke run used warmup. Filter on metadata.benchmark_phase or phase_kind regardless.",
+   "Also untested: that a plain CLI warmup+profiling run writes phases/warmup/ and phases/profiling/ plus phase_manifest.json. The code says it does, because the run has two concrete phases.",
+   "The multi_turn fixed-schedule workaround: in the smoke dataset the top-level timestamp equalled turns[0].timestamp, so it is unproven which one drives the schedule. Make them identical in the generated file.",
+   "In-flight requests cancelled at the grace timeout or by Ctrl+C leave no record and appear in no export I found. The only visible count is the WARNING log line from runner.py around :1057-1066. The wrapper cannot count them as errors without parsing logs.",
+   "One discarded pre-sampled conversation per REQUEST_RATE phase boundary is inferred from code (request_rate.py:146-147). It shifts which sessions each stage uses in a shared-file YAML run.",
+   "A fixed_schedule profiling phase replays every conversation, including ones a preceding warmup phase already sent. The effect on prefix-cache hit rate is inferred, not measured.",
+   "The CPU cost of the busy loop in the TimingManager while all sessions sit in think time (CONCURRENCY_BURST plus yield_to_event_loop) was not measured.",
+   "Ctrl+C handling in sweep mode is untested: cancel_check is not wired by the CLI, and the variation subprocess runs under asyncio.to_thread.",
+   "Out of scope for timing: how the next turn's history is built when the previous turn errored (run4 shows the session continues). Also how a leading turns[] entry with role 'system' is treated; the smoke datasets used one."
+  ],
+  "corrections": [
+   {
+    "question": "1. --concurrency semantics",
+    "before": "confidence read-in-source; think-time start point not stated",
+    "after": "verified-by-run (smoke run1): the slot is held through think time, a new session starts about 0.6 ms after the final turn returns, and think time counts from the previous response END. Added a separate verified fact that an errored turn does not end the session (run4).",
+    "reason": "Existing run artifacts confirm the claims empirically and add the response-end anchor and error-continuation behavior."
+   },
+   {
+    "question": "1. evidence line refs",
+    "before": "concurrency.py:392-400; issuer.py:297-351; callback_handler.py:609-637; timing/config.py:682",
+    "after": "concurrency.py:392-403; issuer.py:263-351 (needs_session_slot at :324, try_issue_credit :353-401); callback_handler.py:620-638; timing/config.py:683",
+    "reason": "Line numbers re-checked against the v0.12.0 clone."
+   },
+   {
+    "question": "2. Duration control",
+    "before": "--request-count caps turns; docs mutual exclusion not mentioned; no note on how cancelled requests are observable",
+    "after": "--request-count (alias --num-requests) and --num-sessions can be combined (verified by conversion), which contradicts timing-modes-reference.md:55-56. Cancelled in-flight requests are visible only in a WARNING log line.",
+    "reason": "The conversion run kept requests=20 and sessions=5 together. Source shows no export field for cancelled credits."
+   },
+   {
+    "question": "3. Warmup session consumption",
+    "before": "warmup uses the first sessions in file order and profiling continues from the next session",
+    "after": "Profiling continues after the warmup's sessions but skips one: each REQUEST_RATE phase pre-samples the next conversation (request_rate.py:146-147) and discards it at phase end (inferred)",
+    "reason": "ConversationSource.next() consumes the shared sampler (conversation_source.py:182-191), and the cached turn is never issued once the loop exits."
+   },
+   {
+    "question": "3. Warmup concurrency with a list --concurrency",
+    "before": "if --concurrency is a comma list, warmup concurrency becomes 1",
+    "after": "Becomes 1 only when warmup has no rate (type concurrency). With a warmup or profiling request rate, a list concurrency leaves warmup with no concurrency cap (None).",
+    "reason": "_converter_warmup.py:53-76; the no-rate case was verified by conversion (warmup concurrency 1)."
+   },
+   {
+    "question": "3/4. Per-phase output",
+    "before": "phases/ directory written whenever the run has more than one concrete phase (profiling stages implied)",
+    "after": "phases/<name>/ is also written for WARMUP phases. A plain CLI run with warmup+profiling counts as two concrete phases.",
+    "reason": "records_manager.py:1535-1557: _iter_concrete_phase_stats() with no phase filter includes warmup trackers."
+   },
+   {
+    "question": "4. YAML multi-phase",
+    "before": "YAML example unvalidated; CLI flags assumed combinable; phase type list without agentic_replay",
+    "after": "The example YAML validates with load_config() in aiperf 0.12.0 (sampling resolves to SEQUENTIAL). With more than one profiling phase, CLI load-gen flags raise ConfigurationError, so every stage parameter must be in the YAML. PhaseType also includes agentic_replay.",
+    "reason": "Ran load_config on scratchpad/verify-timing/stages.yaml; flags/resolver.py:522-549."
+   },
+   {
+    "question": "4. open issue on per-phase percentiles",
+    "before": "not checked whether phases/<name>/ files carry the same percentile set as root",
+    "after": "The same MetricsJsonExporter/MetricsCsvExporter classes write them (exporter_manager.py:152-167), so the stat keys match: avg,count,max,min,p1,p5,p10,p25,p50,p75,p90,p95,p99,std,sum,unit. Root rates for multi-profiling runs are recomputed over summed active durations.",
+    "reason": "Source plus the run1 JSON key listing."
+   },
+   {
+    "question": "5. multi_turn + fixed_schedule workaround",
+    "before": "adding a top-level `timestamp` is an untested, inferred workaround",
+    "after": "VERIFIED by smoke run2: a top-level timestamp on each record passes the resolver, and the run replays all 9 turns. The nested-only variant fails with the exact 'has no timing data in its first record' error (run2_attempt1 log).",
+    "reason": "Existing run artifacts in scratchpad/smoke."
+   },
+   {
+    "question": "5. cap-exceeded behavior",
+    "before": "first turns beyond the cap are queued and fire late (read-in-source)",
+    "after": "Verified: sess-B turn 0, scheduled at 100 ms, fired at 3391.5 ms, right after sess-A's final turn ended at 3391.0 ms, with --concurrency 1. It was not dropped and nothing was counted.",
+    "reason": "run2/profile_export.jsonl credit_issued_ns."
+   },
+   {
+    "question": "5. request count under fixed schedule",
+    "before": "PhaseRunner overrides total_expected_requests from dataset metadata",
+    "after": "Also: the CLI converter first sets requests = number of JSONL lines (3 for 3 multi_turn sessions). PhaseRunner replaces it with total_turn_count, and 9 turns were sent.",
+    "reason": "Conversion output {requests: 3} vs run2 with 9 records."
+   },
+   {
+    "question": "5. timestamp+delay on one turn",
+    "before": "A turn cannot have both",
+    "after": "The validator is truthiness-based (`if self.timestamp and self.delay`), so timestamp=0 with a delay passes. At dispatch, timestamp takes priority over delay.",
+    "reason": "dataset/loader/models.py:132; fixed_schedule.py:165-174."
+   },
+   {
+    "question": "6. rate mode at cap",
+    "before": "the tick is lost, and nothing is queued or counted",
+    "after": "The tick is lost, but the pre-sampled conversation is kept and retried on the next tick. User-centric mode with a custom multi_turn file also fails unless --session-turns-mean >= 2 is passed.",
+    "reason": "request_rate.py:217-220 does not re-sample on None; converter check at _converter_profiling.py:241-250 was verified by conversion."
+   },
+   {
+    "question": "7. sweep cancellation",
+    "before": "In sweep mode, cancel_check aborts the remaining variations",
+    "after": "The v0.12.0 CLI never passes cancel_check (cli_runner/_multi_run.py:154-157). The variation subprocess runs under asyncio.to_thread, so a SIGINT sent only to the parent PID likely does not reach it (inferred). Signal the process group, or avoid CLI sweeps.",
+    "reason": "The only execute() call site omits cancel_check."
+   },
+   {
+    "question": "7. exit code",
+    "before": "Exit code after graceful Ctrl+C not determined",
+    "after": "os._exit(1 if self._exit_errors else 0), so 0 after a clean graceful cancel (read-in-source). The failed_request_threshold abort path exits non-zero.",
+    "reason": "system_controller.py:1084; phases.py:275-283."
+   },
+   {
+    "question": "8. high-load warning",
+    "before": "warning whenever a worker's CPU > 85%",
+    "after": "The warning is also suppressed while the worker is in ERROR status (a failed task within AIPERF_WORKER_ERROR_RECOVERY_TIME, 3.0 s), because the high-load check is an elif after the error branch. The worker cap uses the max concurrency across PROFILING phases of any type.",
+    "reason": "worker_manager.py:93-109,149-161; environment.py:1538-1541."
+   }
+  ]
+ },
+ {
+  "topic": "AIPerf v0.12.0 output artifacts and metrics (artifact layout, aggregate JSON, per-record JSONL, server token counts, goodput, live /metrics, error accounting) — adversarially re-verified",
+  "facts": [
+   {
+    "question": "1a. Artifact directory flag and default path naming",
+    "answer": "Confirmed.\n- The flag is `--output-artifact-dir`, with alias `--artifact-dir`. The YAML key is `artifacts.dir`. The default is `./artifacts`.\n- If the user sets the directory (the CLI converter copies `dir` only when the flag was actually passed), AIPerf uses it as-is.\n- Otherwise AIPerf adds a subdirectory named `<model>-<service_kind>-<endpoint_type>-<stimulus>`. In the model name, `/` becomes `_`, and `_multi` is appended when there are several models. The stimulus comes from the first phase that is not excluded from results: `concurrency{N}`, `concurrency{N}-request_rate{R}`, `request_rate{R}`, `user_centric-users{N}-qps{R}` or `fixed_schedule`.\n- Observed example: `artifacts/org_mock-model-openai-chat-concurrency4-request_rate2.0/`, plus a stray `artifacts/logs/aiperf.log` at the base.\n- New detail: if `--profile-export-prefix` is given as an absolute path, AIPerf drops its directory part, so the prefix cannot move files out of the artifact dir.\n- Recommendation: always pass an explicit `--artifact-dir` for each stage.",
+    "evidence": [
+     "src/aiperf/config/flags/cli_config.py:2497-2511",
+     "src/aiperf/config/flags/_converter_runtime.py:29-34,49-58,70-75 (_propagate_set_fields: dir only when artifact_directory is in model_fields_set; absolute prefix -> p.name)",
+     "src/aiperf/config/artifacts.py:42-47,82-89",
+     "src/aiperf/config/resolution/resolvers.py:97-102,140-222",
+     "observed: scratchpad/outputs_probe/artifacts/{org_mock-model-openai-chat-concurrency4-request_rate2.0/, logs/aiperf.log}; run_err (with --artifact-dir) has no subdir"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "1b. Every exported file name",
+    "answer": "The file names are confirmed, with these corrections and additions.\n\nSummary and records:\n- `profile_export_aiperf.json` (turned off only by `artifacts.summary: false`).\n- `profile_export_aiperf.csv`: always written. It uses display headers and rounds values to 2 decimals, so parse the JSON instead.\n- `profile_export.jsonl`: written for `--export-level` (alias `--profile-export-level`) `records` (the default) or `raw`. `summary` turns it off.\n- `profile_export_raw.jsonl`: `raw` only. It is built from `raw_records/raw_records_<sanitized service_id>.jsonl` fragments.\n- `profile_export_console.txt`, `inputs.json`, `logs/aiperf.log`\n\nServer metrics:\n- `server_metrics_export.{json,csv}` by default.\n- CORRECTION: `--server-metrics-formats` REPLACES the default list `[json, csv]`; it does not add to it. Choices are json, csv, jsonl and parquet. To get jsonl as well, pass `--server-metrics-formats json csv jsonl`.\n- `--no-server-metrics` turns scraping off.\n\nOptional files:\n- `gpu_telemetry_export.jsonl` (can be 0 bytes)\n- `profile_export_aiperf_timeslices.{csv,json}`, only with `--slice-duration`\n- `outputs.json` and `output_fragments/`, only with `--export-outputs-json`\n- `profile_export_network_latency.jsonl`, `accuracy_export.jsonl`, `checkpoints/`\n\nWith `--profile-export-prefix foo`: `foo.json`, `foo.csv`, `foo.jsonl`, `foo_raw.jsonl`, `foo_console.txt`, `foo_timeslices.*`, `foo_gpu_telemetry.jsonl`, `foo_server_metrics.*`, `foo_accuracy.jsonl`, `foo_network_latency.jsonl`. `inputs.json` and `outputs.json` are not prefixed.\n\nPer-phase files (only when there is more than one concrete phase; warmup plus profiling counts):\n- `phase_manifest.json`: `{\"schema_version\":1,\"phases\":[...]}` sorted by phase_index, with keys sorted alphabetically.\n- Each entry always has `phase_index`, `profiling_index`, `phase_name`, `phase_kind`, `start_ns`, `end_ns`, `was_cancelled`, `successful_request_count`, `error_request_count`, `total_request_count` and `error_summary`.\n- `metrics_json`, `metrics_csv`, `server_metrics_json` and `gpu_telemetry_json` appear only when that file was written.\n- `phases/<phase_name>/profile_export_aiperf.{json,csv}` (with a prefix, `<prefix>.json` and `<prefix>.csv`), plus `phases/<phase_name>/server_metrics.json` and `gpu_telemetry.json`. These last two have their own shape: `{schema_version:1, phase:{...}, data, warnings}`.\n\nMulti-run (CORRECTED locations):\n- Each run goes in `<base>/profile_runs/run_NNNN/`.\n- The aggregates go in `<base>/aggregate/profile_export_aiperf_aggregate.json`, `<base>/aggregate/profile_export_aiperf_aggregate.csv` and `<base>/aggregate/profile_export_aiperf_collated.json`.\n\nNote on `inputs.json`: its payloads are per-turn pre-rendered messages WITHOUT the accumulated assistant history (observed: 2 messages per turn for every turn). The real wire payload with history appears only in `profile_export_raw.jsonl` (observed: turn 0 has 2 messages, turn 1 has 4, turn 2 has 6).",
+    "evidence": [
+     "src/aiperf/config/artifacts.py:42-70,110-129,266-400 (incl. accuracy_export_jsonl_file)",
+     "src/aiperf/config/flags/cli_config.py:2513-2545",
+     "src/aiperf/config/flags/_converter_runtime.py:62-69 (export_level -> records/raw)",
+     "src/aiperf/config/flags/_converter_telemetry.py:196-197 (formats = list(cli.server_metrics_formats))",
+     "aiperf profile --help: '--server-metrics-formats ... [choices: json, csv, jsonl, parquet] [default: [json, csv]]'",
+     "src/aiperf/exporters/exporter_manager.py:120-196,198-243,279-296",
+     "src/aiperf/records/records_manager.py:1553-1558",
+     "src/aiperf/post_processors/raw_record_writer_processor.py:50-60",
+     "src/aiperf/orchestrator/strategies.py:238,249-287 (profile_runs/run_NNNN, aggregate/)",
+     "src/aiperf/cli_runner/_aggregate.py:57-77",
+     "observed: outputs_probe/run_err file tree + phase_manifest.json; smoke/run1 inputs.json [2,2,2] vs profile_export_raw.jsonl messages 2/4/6"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "2. Schema of the aggregate JSON (profile_export_aiperf.json)",
+    "answer": "Confirmed:\n- Top-level keys: `schema_version` (\"1.4\"; the docs list 1.5, which v0.12.0 code does not emit), `aiperf_version`, `benchmark_id`, `input_config`, `run_info`, `was_cancelled`, `error_summary` (profiling phase only), `start_time`, `end_time`, `telemetry_data`, `warmup_metrics`, and optional `metadata` and `branch_stats`.\n- Metric blocks sit at the top level, keyed by tag. The dump uses exclude_unset + exclude_none, so null fields are omitted.\n- Record metrics carry `unit`, `avg`, `min`, `max`, `std` (population), `p1`–`p99` (linear interpolation), `count` and `sum`.\n- Counter and derived scalars carry `{unit, avg}` only. Exception: sweep metrics (`effective_*`, `active_*`, `tokens_in_flight`) also carry min, max, std and some percentiles, but no count.\n- `inter_chunk_latency` percentiles come from a t-digest.\n- `adj_*` percentiles use nearest-rank on the success values plus +inf per failure. Because infinite values are dropped, `avg`, `max`, `sum` and the high percentiles disappear.\n- Key paths: `time_to_first_token.{p50,p90,p95,p99}` (ms), `inter_token_latency.p95` (ms, one value per request = (E2E-TTFT)/(OSL-1), skipped when OSL<2), `request_latency.*` (ms), `output_token_throughput.avg` (tokens/sec), `request_throughput.avg` (requests/sec), `request_count.avg` (successes), `error_request_count.avg`, `completed_request_count.avg`, `request_error_rate.avg` (%, 0-100), `total_usage_prompt_tokens.avg`, `total_usage_prompt_cache_read_tokens.avg`, `overall_usage_prompt_cache_read_pct.avg` (= sum cached / sum prompt × 100, over successful records only), `goodput.avg`, `good_request_count.avg`, `good_request_fraction.avg`.\n\nCORRECTION on throughput denominators:\n- `output_token_throughput`, `request_throughput`, `goodput` (and other rates that use `observation_duration`) divide by the PHASE WINDOW, not by `benchmark_duration`.\n- The phase window runs from phase `start_ns` to the end of the last request, errors included. It equals `phase_manifest` end_ns-start_ns and the JSON `start_time`..`end_time`.\n- `benchmark_duration` covers successful records only: min request start to max response end.\n- Observed: 13 / 2.261140 = 5.749311 s = manifest window. `benchmark_duration.avg` = 5.746687 s, which matches the first-to-last span of successful records only.\n\n`start_time` and `end_time` are naive local time. Observed \"2026-09-23T17:10:08.414556\" on a KST host, which is 08:10 UTC.\n\nConditional keys:\n- `error_request_count`, `completed_request_count` and `request_error_rate` are absent when there are 0 errors (observed in 5 zero-error smoke runs).\n- Goodput keys appear only when SLOs are set.\n- `adj_*` keys appear only when there are errors.\n\nIf a run has several profiling-kind phases, the top-level metrics merge all of them; per-phase numbers are in `phases/<name>/`.",
+    "evidence": [
+     "src/aiperf/common/models/export_models.py:25-67 (JsonMetricResult), 281-370 (JsonExportData, SCHEMA_VERSION='1.4')",
+     "src/aiperf/exporters/metrics_json_exporter.py:46-66 (datetime.fromtimestamp, naive local), 204-209 (exclude_unset/exclude_none + scrub_non_finite)",
+     "src/aiperf/metrics/metric_dicts.py:52-101 (linear interp, ddof=0), 217-238 (observation_duration uses window_end_ns-window_start_ns when set)",
+     "src/aiperf/metrics/accumulator.py:283-302,555-566 (window_start/end_ns from export ctx = phase stats)",
+     "src/aiperf/records/records_manager.py:1419-1440,1919-1960 (ctx start_ns=phase_stats.start_ns, end_ns=requests_end_ns; error_summary for PROFILING)",
+     "src/aiperf/records/records_manager.py:407-419 (_has_multiple_phase_instances -> aggregate stats across profiling phases)",
+     "src/aiperf/metrics/types/output_token_throughput_metrics.py:24-44; request_throughput_metric.py:19-40; benchmark_duration_metric.py:21-45; min_request_metric.py (record.timestamp_ns, non-ERROR_ONLY)",
+     "src/aiperf/metrics/types/request_error_rate_metric.py:24-44; completed_request_count_metric.py; usage_total_metrics.py:320-362",
+     "src/aiperf/metrics/derived_latency.py:173-257 (method='nearest', +inf inflation)",
+     "docs/reference/list-metric-aggregation.md:9-60 (t-digest for inter_chunk_latency)",
+     "docs/reference/json-export-schema.md:140-148 (lists 1.5 — not emitted by v0.12.0 code), :68 ('UTC' — contradicted)",
+     "observed: outputs_probe/run_err/profile_export_aiperf.json request_count 13, request_throughput 2.261140508836624, benchmark_duration 5.746686976; phase_manifest profiling window 5.749311 s; smoke/run1,run1e,run1f,run2,run3 lack error_request_count/request_error_rate/completed_request_count; smoke/run4 (errors) has them"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "3. Schema of the per-request records export",
+    "answer": "`profile_export.jsonl`. Each line is `{\"metadata\":{...}, \"metrics\":{tag:{\"value\",\"unit\"}}, \"error\"?:{...}, \"trace_data\"?:{...}}`. It is serialized with exclude_none, so successful lines have no `error` key. Records with no displayable metrics are skipped unless they carry an error.\n\nCORRECTIONS:\n- `metadata.session_num` is `credit_num`, which RESTARTS AT 0 IN EACH PHASE. Observed: warmup 0..2, profiling 0..23. It is unique only within one phase; use `x_request_id` for a globally unique id.\n- `x_correlation_id` is a fresh UUID per runtime session instance, shared by all turns of that instance. It did NOT span warmup and profiling in the observed run: the warmup session was cut off after 2 of 3 turns, and profiling started new sessions with new ids. Group by (`x_correlation_id`) within `benchmark_phase == \"profiling\"`.\n- `request_ack_ns` is the time the 2xx response HEADERS arrived (set right after the status check, before the body is read), not the first body byte. It is absent for non-2xx responses and for exceptions raised before headers.\n\nOther metadata fields, confirmed:\n- `conversation_id` (dataset session_id, repeats when the conversation is reused), `turn_index` (0-based)\n- `credit_issued_ns`, `request_start_ns`, `request_end_ns` (time.time_ns wall clock); `request_end_ns == request_start_ns` for HTTP-error records\n- `worker_id`, `record_processor_id`, `benchmark_phase`, `phase_index`, `profiling_index`, `phase_name`, `phase_kind`\n- `was_cancelled`, `cancellation_time_ns`, `context_overflow_skip`, `agent_depth`, `root_correlation_id`, `parent_correlation_id`, `source_*`\n- Warmup records are included in the file.\n\nSuccessful-record metrics (observed): `time_to_first_token`, `request_latency`, `inter_token_latency` (scalar ms), `inter_chunk_latency` (list of ms gaps between content SSE chunks), `time_to_second_token`, `time_to_first_output_token`, `decode_duration`, `input_sequence_length`, `output_sequence_length`, `output_token_count`, `reasoning_token_count`, `usage_{prompt,completion,total,prompt_cache_read,reasoning,accepted_prediction,rejected_prediction}_tokens`, `output_token_throughput_per_user`, `e2e_output_token_throughput`, `prefill_throughput_per_user`, `osl_mismatch_diff_pct`, `http_req_*`, and `good_request_count` (0/1, only with SLOs).\n\nError records:\n- `metrics` is `{}`, or `{\"error_isl\":...}` only with client-side tokenization.\n- `error` is `{code, type, message}`. Exception-derived errors also carry `cause` (if any) and `cause_chain` (a list of exception class names). `message` is the redacted repr, truncated at 4096 chars.\n\nRaw export (`profile_export_raw.jsonl`): `metadata`, `start_perf_ns`, `payload` (the actual wire body including history and `stream_options`), `request_headers`, `status` (e.g. 500 on HTTP errors), optional `response_headers`, `responses` and `error`.",
+    "evidence": [
+     "src/aiperf/common/models/record_models.py:157-305 (MetricRecordMetadata; session_num doc says session index — wrong for v0.12.0)",
+     "src/aiperf/records/record_processor_service.py:218-272 (session_num=credit_num at :265; request_ack_ns from recv_start_perf_ns at :239-241)",
+     "src/aiperf/transports/aiohttp_client.py:159-174 (non-2xx early return before recv_start_perf_ns set at :174)",
+     "src/aiperf/common/mixins/buffered_jsonl_writer_mixin.py:122-134 (exclude_none + scrub_non_finite)",
+     "src/aiperf/post_processors/record_export_jsonl_writer.py:66-93",
+     "src/aiperf/common/models/record_models.py:1594-1680 (MetricRecordInfo, RawRecordInfo)",
+     "src/aiperf/common/models/error_models.py:12-100 (cause, cause_chain, _safe_repr max_len=4096)",
+     "src/aiperf/timing/conversation_source.py:5-49 (x_correlation_id = per-session UUID)",
+     "observed: outputs_probe/run_err/profile_export.jsonl session_num warmup [0,1,2], profiling [0..23]; correlation 3d1e7938 = warmup-only sess-A turns 0,1; profiling sessions have distinct ids; success record has request_ack_ns, error record lacks it",
+     "observed: smoke/run1/profile_export_raw.jsonl keys ['metadata','payload','request_headers','responses','start_perf_ns','status']"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "4. --use-server-token-count when usage is missing",
+    "answer": "Confirmed.\n\nPayload handling: with streaming chat plus the flag, AIPerf calls `_ensure_include_usage`. It adds `stream_options.include_usage=true` but keeps any existing `stream_options` keys, including an explicit `include_usage:false`.\n\nWhere the counts come from: the last chunk that carries `usage`.\n- ISL = `prompt_tokens`\n- OSL = `completion_tokens` minus reasoning tokens\n- Client-side tokenization is disabled, so error records get no `error_isl`.\n- USAGE_DIFF_ONLY metrics are turned off.\n\nWhen no chunk has usage:\n- All token counts are None.\n- The request still counts as a success.\n- A WARNING goes to `logs/aiperf.log` once per request: \"Server did not provide token usage information. Token count metrics will be unavailable. Verify that your API endpoint supports usage reporting (stream_options are automatically configured for OpenAI-compatible endpoints).\" Observed 9 times in the log for 9 requests, 0 times in stdout with `--ui none`.\n\nAffected metrics are OMITTED, both in the JSON and per record:\n- Omitted: ISL, OSL, output_token_count, ITL, output_token_throughput, output_token_throughput_per_user, total_isl, total_osl, total_output_tokens, usage_*, total_usage_*, overall_usage_prompt_cache_read_pct.\n- Still present: TTFT, request_latency, inter_chunk_latency, request_count, request_throughput, benchmark_duration, http_req_*, effective_*, active_*.\n\nHow the wrapper can detect it: `usage_prompt_tokens` missing, or `usage_prompt_tokens.count < request_count.avg`, or `output_sequence_length.count < request_count.avg`.\n\nCache reporting:\n- If usage is present but `cached_tokens` is absent, AIPerf warns once with the CACHE_REPORTING_HINT (vLLM `--enable-prompt-tokens-details`, SGLang `--enable-cache-report`) and omits the cache metrics.\n- A cached value of 0 counts as reported.\n- Cached tokens are read from `prompt_tokens_details.cached_tokens` or `input_tokens_details.cached_tokens`, then from vendor top-level synonyms.",
+    "evidence": [
+     "src/aiperf/config/flags/cli_config.py:313-330",
+     "src/aiperf/endpoints/openai_chat.py:74-78,148-159",
+     "src/aiperf/records/inference_result_parser.py:309-316,488-535",
+     "src/aiperf/records/payload_retention.py:42-61 (resolve_disable_tokenization: use_server_token_count -> no tokenization)",
+     "src/aiperf/post_processors/base_metrics_processor.py:52-55",
+     "src/aiperf/metrics/cache_reporting_hint.py:23-64; src/aiperf/records/records_manager.py:702-714",
+     "src/aiperf/common/models/usage_models.py:327-343 (prompt_cache_read_tokens sources)",
+     "observed: outputs_probe/run_nousage/profile_export_aiperf.json metric set (no usage/ISL/OSL/ITL/output_token_throughput; request_count 9); first JSONL record metrics lack usage/OSL; grep -c warning logs/aiperf.log = 9, run_nousage.log = 0"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "5. Goodput / SLO flags and where results appear",
+    "answer": "Syntax and semantics, confirmed:\n- `--goodput \"time_to_first_token:100 inter_token_latency:20\"` (space-separated `KEY:VALUE` pairs in display units). The YAML equivalent is `slos: {tag: value}`.\n- Per-request check: a request is good only if it meets every threshold (`<=`, or `>=` for LARGER_IS_BETTER metrics).\n- A request missing a metric (for example ITL when OSL<2) is not good, and failed requests are never good.\n\nCORRECTION on validation errors:\n- `_configure_goodput` compares the SLO tags with the applicable tags BEFORE it calls `set_slos`.\n- So an unknown tag and an inapplicable tag both raise `RuntimeError(\"Invalid --goodput: metric(s) <tags> are not applicable to the current endpoint/configuration.\")`.\n- The `ValueError(\"Unknown metric tag(s) in --goodput: <tag>.\")` in `set_slos` is effectively unreachable from this path.\n\nOutputs:\n- JSON `goodput.avg` (requests/sec = good_request_count / the PHASE WINDOW, not benchmark_duration), `good_request_count.avg`, `good_request_fraction.avg` (ratio = good / (request_count + error_request_count), with errors defaulting to 0).\n- CSV rows `Goodput (requests/sec)`, `Good Request Count`, `GoodRequestFraction (ratio)`.\n- A console Goodput row.\n- Per-record `metrics.good_request_count.value` 0 or 1.\n- Live: `aiperf_goodput_avg_requests_per_sec`.\n- Observed: good_request_count 13, good_request_fraction 0.5417, goodput 2.2611 (= 13/5.749311).\n\nAIPerf has no percentile SLO in profile mode, so the wrapper computes its ttft_p95, itl_p95 and error_rate pass/fail itself.",
+    "evidence": [
+     "src/aiperf/config/flags/cli_config.py:805-824",
+     "src/aiperf/config/config.py:282-290; src/aiperf/config/slos.py:14-27",
+     "src/aiperf/post_processors/base_metrics_processor.py:72-94 (missing_tags check raises RuntimeError before set_slos), 112-113",
+     "src/aiperf/metrics/types/good_request_count_metric.py:30-120",
+     "src/aiperf/metrics/types/goodput_metric.py:27-35 (observation_duration); good_request_fraction_metric.py:57-68",
+     "observed: outputs_probe/run_err profile_export_aiperf.json/csv/console.txt rows; live_metrics.txt aiperf_goodput_avg_requests_per_sec"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "6. --api-port live endpoint: exact /metrics metric names",
+    "answer": "Confirmed.\n\nServer and routes:\n- `--api-port N` starts FastAPI. `--api-host` defaults to 127.0.0.1 and needs `--api-port`. The env equivalent is `AIPERF_API_SERVER_PORT`.\n- Routes: `/metrics`, `/api/metrics`, `/api/progress`, `/api/workers`, `/api/results`, `/api/results/list`, `/api/results/files/{filename}`, `/api/run`, `/api/config`, `/healthz`, `/readyz`, `/docs`.\n- `aiperf_info{benchmark_id,model,endpoint_type,streaming,concurrency[,request_rate],version} 1` is always present. `concurrency` and `request_rate` come from the first profiling phase.\n\nWhen the series appear:\n- Realtime series are published only under `--ui dashboard` or with `AIPERF_UI_REALTIME_METRICS_ENABLED=true`. Otherwise only `aiperf_info` is served (observed).\n- The interval is `--stats-interval`: default 5s under dashboard, 30s otherwise. It overrides `AIPERF_UI_REALTIME_METRICS_INTERVAL`.\n- Scope is the profiling phase only.\n\nNaming rules:\n- Summary: `aiperf_<tag>_<unit>{quantile=...}` plus `_sum` and `_count`.\n- Gauges: `aiperf_<tag>_<stat>_<unit>` for avg, min, max, std and current. Scalar metrics also get `_count_<unit>` = 1.\n- Unit rewrites: `%`→`percent`, `/`→`_per_`, `tokens_per_sec`→`tps`.\n\nNames observed:\n- `aiperf_time_to_first_token_ms` (summary) and `_avg_ms`\n- `aiperf_inter_token_latency_ms`, `aiperf_request_latency_ms`\n- `aiperf_output_token_throughput_avg_tps`, `aiperf_request_throughput_avg_requests_per_sec`\n- `aiperf_request_count_avg_requests`, `aiperf_completed_request_count_avg_requests`, `aiperf_request_error_rate_avg_percent`\n- `aiperf_goodput_avg_requests_per_sec`, `aiperf_overall_usage_prompt_cache_read_pct_avg_percent`\n- `aiperf_total_usage_{prompt,completion,prompt_cache_read}_tokens_avg_tokens`, `aiperf_usage_prompt_cache_read_tokens_tokens`\n- `aiperf_output_token_throughput_per_user_tps_per_user`, `aiperf_adj_*_ms`, `aiperf_effective_*`, `aiperf_tokens_in_flight_*`\n\nNever exposed live: ERROR_ONLY, INTERNAL, EXPERIMENTAL and console_group NONE metrics. That includes `error_request_count`, `inter_chunk_latency`, `benchmark_duration`, `total_osl`, `total_isl`, `total_output_tokens`, `good_request_count`, `good_request_fraction` and `http_req_*` (0 matches in the live file).\n\nServer-snapshot tags (`prefix_cache_hit_rate`, `kv_cache_usage_pct`, `num_running`, `num_waiting`, ...) exist in the code, but their live names were not observed.",
+    "evidence": [
+     "docs/reference/api-endpoints.md:9-30",
+     "src/aiperf/config/runtime.py:185-220 (stats_interval, api_host requires api_port)",
+     "src/aiperf/api/routers/metrics.py:75-127",
+     "src/aiperf/metrics/prometheus_formatter.py:53-81,195-240",
+     "src/aiperf/records/records_manager.py:1113-1147 (gate), 134-145 (server snapshot tags)",
+     "src/aiperf/records/records_manager_processing.py:280-307 (filter_display_metrics)",
+     "observed: outputs_probe/live_metrics.txt (861 lines) unique-name listing; smoke/run1_api_metrics.txt only aiperf_info"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "7. How errors (HTTP 4xx/5xx, stream cut) are recorded and counted",
+    "answer": "How each failure is recorded, confirmed:\n- Non-2xx: `ErrorDetails(code=<status>, type=<reason phrase>, message=<body text>)`, then an early return. No end timestamp or ack timestamp is set, so `request_end_ns == request_start_ns`.\n- An exception during the request or stream (connection reset, mid-stream disconnect, `--request-timeout-seconds` which defaults to 21600): `ErrorDetails.from_exception`. Type is the class name, message is the redacted repr (up to 4096 chars), and `cause_chain` is filled in. The code is set only when the exception has an int `error_code`.\n- SSE `event: error`: SSEResponseError, code 502.\n- A 200 response with no content chunks: `InvalidInferenceResultError`, code None. Its message repr includes the note \"No responses with actual content were received from the server...\".\n- Request-cancellation timeout: `RequestCancellationError`, code 499. `RequestSendTimeout`: code 0. Worker credit failure: `CreditProcessingError`, code 500.\n- Error records go to metrics with `responses=[]`, so partial chunks are discarded for metrics. They carry no latency or token metrics, and have `error_isl` only with client-side tokenization.\n\nCounting:\n- `request_count` counts successes only; `error_request_count` counts errors (ERROR_ONLY).\n- `completed_request_count` = ok + err. `request_error_rate` = 100·err/(ok+err).\n- `error_summary` is grouped by (code, type, message), per phase: top-level JSON = profiling, and each `phase_manifest` entry has its own.\n- Warmup errors are counted separately (`warmup_metrics`, `phases/warmup`).\n- `--failed-request-threshold` aborts once profiling errors/total exceeds the ratio, after max(concurrency, 10) records. The run then exits non-zero.\n\nNEW (resolves a previous open issue): after an HTTP 500 turn, the session continues, but the failed turn produces no assistant message. The next turn's history therefore has two consecutive user messages: `[system, user, user]`, then `[system, user, user, assistant, user]` (observed in the raw export).",
+    "evidence": [
+     "src/aiperf/transports/aiohttp_client.py:159-174,286-303,398-448",
+     "src/aiperf/transports/sse_utils.py:84-115",
+     "src/aiperf/common/exceptions.py:131-146 (InvalidInferenceResultError repr includes notes), 213-218",
+     "src/aiperf/common/models/record_models.py:1560-1591",
+     "src/aiperf/records/inference_result_parser.py:148-248",
+     "src/aiperf/common/models/error_models.py:12-136",
+     "src/aiperf/records/error_tracker.py:13-79",
+     "src/aiperf/records/records_manager.py:658-700",
+     "src/aiperf/config/endpoint.py:52 (TIMEOUT = 6*60*60)",
+     "src/aiperf/workers/worker.py:880 (CreditProcessingError 500), 1147-1159 (store_response only when assistant_turn is not None)",
+     "src/aiperf/endpoints/base_endpoint.py:134-158 (build_assistant_turn returns None for error/empty responses)",
+     "observed: outputs_probe/run_err error_summary [{code:500,type:'Internal Server Error',message:'{\"detail\":\"Simulated error\"}',count:11}]",
+     "observed: smoke/run4/profile_export_raw.jsonl session 9e107063: turn0 status 500 [system,user]; turn1 [system,user,user]; turn2 [system,user,user,assistant,user]"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "8. (added) Robust source for per-stage success/error counts",
+    "answer": "Because `error_request_count`, `request_error_rate` and `completed_request_count` are omitted at 0 errors, and `request_count` (and hence `request_error_rate`) is likely omitted when every request fails, the wrapper should take stage counts from one of these:\n- (a) `phase_manifest.json` profiling entry: `successful_request_count`, `error_request_count`, `total_request_count`. These are always present, but the file exists only when there is more than one concrete phase, e.g. warmup plus profiling.\n- (b) Counting `profile_export.jsonl` lines with `metadata.benchmark_phase == \"profiling\"`, split by whether the line has an `error` key.\n\nFor the stage duration, `end_ns - start_ns` from the manifest (or `end_time - start_time` from the JSON) is the same denominator AIPerf uses for its throughputs.",
+    "evidence": [
+     "src/aiperf/exporters/exporter_manager.py:141-153",
+     "src/aiperf/metrics/types/request_error_rate_metric.py:33-44 (requires request_count and error_request_count)",
+     "src/aiperf/metrics/base_metric.py:146-152",
+     "observed: outputs_probe/run_err phase_manifest profiling entry successful 13 / error 11 / total 24 matches JSON"
+    ],
+    "confidence": "inferred"
+   },
+   {
+    "question": "B4: when does `aiperf profile` exit non-zero after a profiling phase that completed normally?",
+    "answer": "In two cases it exits 1 even though the phase-complete NOTICE was logged. (1) The whole phase has 0 successful requests and at least 1 error: it logs 'All N inference request(s) failed; no successful responses were collected.' profile_export.jsonl still holds the error records. (2) The phase has no records at all, for example every request was cancelled at drain: it logs 'No profile results to export' and writes no profile_export.jsonl. personaload (SPEC_B §8.3) treats both as a failed stage. A window [W, E_eff) that contains only errors, inside a phase with some successes elsewhere, exits 0 and is measured normally.",
+    "evidence": [
+     "src/aiperf/controller/system_controller.py:1113-1140 (exit errors: 'No profile results to export', successful_request_count == 0 and error_request_count > 0)",
+     "run (B4 review): mock --error-rate 1.0 gave aiperf exit 1, 'complete | completed=260, cancelled=0, errors=260', and a profile_export.jsonl with 260 lines, all code 500",
+     "run (B4 review): mock --ttft 5s, duration 1s, drain 300ms gave 'complete | completed=0, cancelled=4', 'No profile results to export', exit 1 and no profile_export.jsonl"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "B4: do in-flight requests cancelled by a user Ctrl+C leave error records (e.g. code 499)?",
+    "answer": "No. In a partial stage (SIGINT 18 s into a 30 s, concurrency 10 stage) the router logged 'Sent cancellation requests for 5 in-flight credits', and profile_export.jsonl contained 0 error records. Like drain cancellations, user cancellations leave no records, so personaload reports them only as a count (user_cancelled) and a warning.",
+    "evidence": [
+     "run (B4 review): scratchpad b4-review/verify-live/results/vsigint-*: stage.json requests {success: 69, error: 0}, error_codes {}, user_cancelled 5"
+    ],
+    "confidence": "verified-by-run"
+   }
+  ],
+  "openIssues": [
+   "Hang seen in the finder's default-dir run. Confirmed in outputs_probe/run_default_dir.log: 'credits complete' was followed about 300 s later by 'Dataset configuration not received after 300.0s; aborting run.' (the message comes from src/aiperf/records/dataset_gate.py:47), and the process tree did not exit. The wrapper needs a watchdog, should kill the process group, and should treat a missing profile_export_aiperf.json as a failed stage.",
+   "Not verified by a run: whether `request_count` (and therefore `request_throughput`, `request_error_rate` and `completed_request_count`) is absent when every request fails. This is inferred from the required-metric checks.",
+   "Not verified by a run: goodput with an unknown tag. By the source, it raises RuntimeError in `_configure_goodput` inside the record-processing services. It is not clear whether this shows up as a clean CLI error with non-zero exit or as a service failure or hang.",
+   "Mid-stream disconnect was not reproduced. Partial chunks are discarded for metrics. However, the worker builds the assistant history turn from `record.responses` without checking `record.error`, so a partially streamed reply may be stored in the history for the next turn (inferred from worker.py:1147-1159 and base_endpoint.py:134-158). HTTP 4xx/5xx turns, by contrast, leave no assistant message (verified).",
+   "The docs are wrong for v0.12.0 on several points: json-export-schema.md lists schema 1.5 and says start_time is 'UTC' (code emits '1.4' and naive local time); the MetricRecordMetadata docstring calls session_num the session index (it is a per-phase credit_num); tutorials show \"error\": null (the field is omitted).",
+   "ITL definition: `inter_token_latency` is one value per request, (E2E-TTFT)/(OSL-1), with OSL taken from server usage (completion minus reasoning) when --use-server-token-count is on. Its percentiles are across requests. Per-gap distributions exist only as `inter_chunk_latency` (SSE content-chunk gaps, aggregated with t-digest). The spec must say which definition its itl_p95 SLO uses.",
+   "The throughput denominator is the phase window (phase start to the last request end, errors included), not benchmark_duration. It is slightly longer than benchmark_duration, and much longer if the phase has idle think-time tails or requests that ended in errors. The wrapper's $/1M output tokens and tok/s should state which duration they use.",
+   "Live /metrics names for server-scraped snapshot values (prefix_cache_hit_rate, kv_cache_usage_pct, etc.) were not observed. The mock server exposes no engine /metrics."
+  ],
+  "corrections": [
+   {
+    "question": "2. Aggregate JSON: output_token_throughput / request_throughput / goodput formula",
+    "before": "output_token_throughput = total_osl / benchmark_duration; request_throughput = successful request_count / duration; goodput = good_request_count / benchmark_duration",
+    "after": "All three divide by the phase window (phase start_ns to requests_end_ns, errors included; the same as phase_manifest end_ns-start_ns and JSON start_time..end_time), via MetricResultsDict.observation_duration. Observed 13/2.261140 = 5.749311 s, which equals the manifest window, while benchmark_duration was 5.746687 s.",
+    "reason": "metric_dicts.py:217-238 uses window bounds when set, and accumulator.py:555-566 sets them from the export context (the phase stats). This is confirmed numerically on outputs_probe/run_err."
+   },
+   {
+    "question": "2. benchmark_duration definition",
+    "before": "from first request start to last response",
+    "after": "From the first SUCCESSFUL request start to the last SUCCESSFUL response end. Min/max timestamp metrics are not ERROR_ONLY, so error records never feed them.",
+    "reason": "min_request_metric.py has no ERROR_ONLY flag, and error records are processed only by ERROR_ONLY metrics. The observed benchmark_duration 5.746687 s matches the span of successful records (5.746687 s), not all records (5.746702 s)."
+   },
+   {
+    "question": "3. metadata.session_num",
+    "before": "in v0.12.0 this is the request's credit_num, so it is unique per request",
+    "after": "It is credit_num, which restarts at 0 in each phase (observed: warmup 0..2, profiling 0..23), so values repeat across phases. Use x_request_id for a globally unique id.",
+    "reason": "record_processor_service.py:265 plus the observed values in outputs_probe/run_err/profile_export.jsonl."
+   },
+   {
+    "question": "3. x_correlation_id",
+    "before": "shared by every turn of one session instance, including across warmup and profiling",
+    "after": "Shared by every turn of one runtime session instance. It was NOT observed to span warmup and profiling: the warmup session was cut off and the profiling sessions had new UUIDs.",
+    "reason": "In outputs_probe/run_err, grouping by correlation id shows warmup-only id 3d1e7938 (sess-A turns 0-1), and every profiling id holds only profiling records."
+   },
+   {
+    "question": "3. request_ack_ns",
+    "before": "request_ack_ns (first response byte)",
+    "after": "The time a 2xx response's headers arrived (recv_start_perf_ns is set right after the status check, before the body is read). It is absent for non-2xx responses and for exceptions raised before headers.",
+    "reason": "aiohttp_client.py:159-174; record_processor_service.py:239-241. The observed error record has no request_ack_ns."
+   },
+   {
+    "question": "1b. --server-metrics-formats",
+    "before": "`--server-metrics-formats` adds `jsonl` or `parquet`",
+    "after": "It replaces the default list [json, csv] (choices json, csv, jsonl, parquet). Pass `json csv jsonl` to keep the defaults and add jsonl.",
+    "reason": "_converter_telemetry.py:196-197 assigns the list; aiperf profile --help shows [default: [json, csv]]."
+   },
+   {
+    "question": "1b. Multi-run files",
+    "before": "Multi-run only: profile_export_aiperf_aggregate.json and profile_export_aiperf_collated.json",
+    "after": "Each run goes in <base>/profile_runs/run_NNNN/. The aggregates are <base>/aggregate/profile_export_aiperf_aggregate.json, <base>/aggregate/profile_export_aiperf_aggregate.csv and <base>/aggregate/profile_export_aiperf_collated.json.",
+    "reason": "orchestrator/strategies.py:238-287; cli_runner/_aggregate.py:57-77."
+   },
+   {
+    "question": "5. --goodput validation errors",
+    "before": "unknown tag raises ValueError(\"Unknown metric tag(s) in --goodput\"); inapplicable tag raises RuntimeError",
+    "after": "Both unknown and inapplicable tags raise RuntimeError(\"Invalid --goodput: metric(s) <tags> are not applicable to the current endpoint/configuration.\"), because the applicable-tags check runs before set_slos. The ValueError path is effectively unreachable from the CLI.",
+    "reason": "base_metrics_processor.py:72-94: missing_tags = slo_tags - applicable_tags raises before set_slos is called."
+   },
+   {
+    "question": "2. adj_* percentile method",
+    "before": "(implied linear interpolation like other record metrics)",
+    "after": "adj_* percentiles use np.percentile(method=\"nearest\") on the success values plus +inf per failure. Values that become infinite are dropped from the JSON.",
+    "reason": "derived_latency.py:233."
+   },
+   {
+    "question": "2. Aggregate/derived metric block shape",
+    "before": "Aggregate and derived metrics carry only {unit, avg}",
+    "after": "Counters and rate scalars carry {unit, avg}. Sweep-derived metrics (effective_*, active_*, tokens_in_flight) also carry min, max, std and some percentiles, but no count.",
+    "reason": "Observed in outputs_probe/run_err CSV and JSON (e.g. Active Decode Throughput has p50/p90/p95/p99)."
+   },
+   {
+    "question": "2. schema_version and docs",
+    "before": "schema_version \"1.4\"",
+    "after": "The code emits \"1.4\" (confirmed). docs/reference/json-export-schema.md already lists 1.5 (telemetry rename), which v0.12.0 does not emit. The wrapper should accept 1.4 and ignore unknown fields.",
+    "reason": "export_models.py SCHEMA_VERSION='1.4'; docs :146."
+   },
+   {
+    "question": "7 / openIssues. History after a failed turn",
+    "before": "Unknown what conversation history AIPerf sends for the turn after a failed turn",
+    "after": "For HTTP errors no assistant message is stored, so the next turn has consecutive user messages ([system,user,user], then [system,user,user,assistant,user]).",
+    "reason": "Verified in smoke/run4/profile_export_raw.jsonl (--export-level raw, mock with errors); worker.py:1147-1159; base_endpoint.py:134-158."
+   },
+   {
+    "question": "1b. inputs.json content",
+    "before": "inputs.json: {\"data\":[{\"session_id\":..., \"payloads\":[<one per turn>]}]}",
+    "after": "Shape confirmed, but the payloads are per-turn pre-rendered messages WITHOUT accumulated assistant history (2 messages per turn). The real wire payload with history appears only in profile_export_raw.jsonl.",
+    "reason": "Observed: smoke/run1 inputs.json [2,2,2] vs raw export 2/4/6 messages."
+   },
+   {
+    "question": "6. live_metrics.txt evidence",
+    "before": "curl /metrics saved to outputs_probe/live_metrics.txt (452 lines)",
+    "after": "The file has 861 lines. The listed names are confirmed to be present.",
+    "reason": "wc -l outputs_probe/live_metrics.txt = 861."
+   },
+   {
+    "question": "evidence line refs",
+    "before": "records_manager.py:652-700; record_processor_service.py:225-272; base_metrics_processor.py:76-94",
+    "after": "records_manager.py:658-700 (_maybe_trigger_failed_request_abort); record_processor_service.py:218-272 (session_num at :265); base_metrics_processor.py:72-94 (_configure_goodput)",
+    "reason": "Line numbers checked with grep -n on v0.12.0."
+   }
+  ]
+ },
+ {
+  "topic": "empirical (adversarial re-verification of the AIPerf 0.12.0 smoke-run findings against the v0.12.0 clone and the scratchpad/smoke artifacts)",
+  "facts": [
+   {
+    "question": "Step 1: install aiperf==0.12.0 into the venv, and is PyPI the same code as git tag v0.12.0?",
+    "answer": "Yes. The venv has aiperf 0.12.0 installed. Its site-packages/aiperf is byte-identical to the clone's src/aiperf: `diff -rq src/aiperf site-packages/aiperf -x __pycache__` printed 0 lines. The clone is at tag v0.12.0 with a clean worktree. Source citations from the clone therefore apply to the PyPI build.",
+    "evidence": [
+     "cmd: diff -rq priorart/aiperf-v0.12.0/src/aiperf aiperf-venv/lib/python3.12/site-packages/aiperf -x __pycache__ | wc -l -> 0",
+     "cmd: aiperf-venv/bin/pip show aiperf -> 'Version: 0.12.0'; git describe --tags -> v0.12.0; git status --porcelain -> (empty)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 1: how to install the mock server",
+    "answer": "tests/aiperf_mock_server is its own setuptools project. Its name is `aiperf-mock-server` 0.12.0 and it provides the console script `aiperf-mock-server = aiperf_mock_server.__main__:main`, with package-dir '.'. The copy-then-install approach worked, and the egg-info was written into scratchpad/mock-copy, not into the clone. `aiperf-mock-server --help` runs.",
+    "evidence": [
+     "tests/aiperf_mock_server/pyproject.toml:10-36",
+     "cmd: ls scratchpad/mock-copy/aiperf_mock_server -> aiperf_mock_server.egg-info present; clone has no egg-info",
+     "cmd: aiperf-mock-server --help (rc=0, saved to scratchpad/verify-empirical-mock-help.txt)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 2: exact mock server command and relevant flags",
+    "answer": "The mock flags exist as claimed: --port/-p (default 8000), --ttft/-t in ms (default 20.0), --itl in ms (default 5.0), --ttft-per-isl-token-ms, --ttft-jitter-cv, --itl-jitter-cv, --error-rate 0-100 (default 0.0), --random-seed, --scheduler-enabled, --fast/-f, --tokenizer (default 'builtin' = tiktoken o200k_base), --record-requests, --access-logs. Additional latency knobs: --itl-per-osl-token-ms, --ttft-concurrency-quad-ms, --itl-concurrency-lin-ms. In run1, measured TTFT p50 was 201.6 ms and ITL avg 25.68 ms at --ttft 200 --itl 25. CAVEAT: --ttft-per-isl-token-ms scales with the mock's own prompt_token_count, which counts only role=user text. It does NOT grow with a long system prompt or with assistant history, so it cannot stand in for prefill cost in persona chat.",
+    "evidence": [
+     "cmd: aiperf-mock-server --help flag list (scratchpad/verify-empirical-mock-help.txt)",
+     "tests/aiperf_mock_server/utils.py:108-112,205-211 (ttft_ms = ttft + ttft_per_isl_token_ms * isl ...)",
+     "tests/aiperf_mock_server/utils.py:423 (isl=tokenized.prompt_token_count)",
+     "tests/aiperf_mock_server/tokens.py:361-365,418-421 (chat text = user messages only)",
+     "run1/profile_export_aiperf.json time_to_first_token p50 201.5957; inter_token_latency avg 25.683"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 2/5: what does mock request recording capture (--record-requests)?",
+    "answer": "Each JSONL line has exactly these keys: ts, request_id, endpoint, model, isl, requested_osl, max_tokens, max_completion_tokens, min_tokens, ignore_eos, reasoning_effort, stream, tokenization_mode ('chat_template_fallback'). No message bodies are stored. <path>.summary.json has the top-level keys total_requests and per_endpoint (count, streamed_count, ignore_eos_count, isl stats and histogram ...). The recorder's isl covers all roles, unlike the usage counter: the recorded values 491/551/615 etc. grow with history. All 74 recorded requests had (max_tokens, max_completion_tokens) == (None, 30).",
+    "evidence": [
+     "scratchpad/smoke/mock_requests.jsonl (74 lines; key set printed)",
+     "scratchpad/smoke/mock_requests.jsonl.summary.json keys ['total_requests','per_endpoint']",
+     "tests/aiperf_mock_server/request_recorder.py:3-22"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Mock usage fields are not representative",
+    "answer": "Confirmed. The mock's usage.prompt_tokens comes from `_extract_chat_messages`, which skips every message whose role != 'user'. Its tokenizer path fails because tokens.py:577 calls `PromptGenerator(config=..., tokenizer=...)` with the outdated signature, so it falls back to character chunking (tokens.py:586 warning, seen in mock.log). cached_tokens = prompt_tokens * (30 + seed % 31) // 100, i.e. a pseudo-random 30-60%. The seed is Python hash(text), so it is only deterministic within one process. With --use-server-token-count, the per-record input_sequence_length equals usage_prompt_tokens (sess-B t0: 9 and 9). ISL, cache % and $/token checks against the mock only exercise the plumbing.",
+    "evidence": [
+     "tests/aiperf_mock_server/tokens.py:418-433",
+     "tests/aiperf_mock_server/tokens.py:97-117",
+     "tests/aiperf_mock_server/tokens.py:577,586",
+     "smoke/mock.log: 'Tokenizer failed (PromptGenerator.__init__() missing 2 required keyword-only arguments: 'prompts' and 'prefix_prompts'), falling back to character-based chunking'",
+     "run1f/profile_export.jsonl line1: input_sequence_length 9, usage_prompt_tokens 9, usage_prompt_cache_read_tokens 4, osl_mismatch_diff_pct -50.0"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 3: multi_turn dataset schema that worked (persona system prompt, per-turn delay, per-turn max tokens)",
+    "answer": "One JSON object per line: {\"session_id\":\"sess-A\",\"turns\":[{\"role\":\"system\",\"text\":\"<persona>\"},{\"role\":\"user\",\"text\":\"...\",\"output_length\":30},{\"role\":\"user\",\"text\":\"...\",\"output_length\":30,\"delay\":500},...]}.\n- SingleTurn fields: timestamp (ms, int|float), delay (ms, int|float), role (str), output_length (int, gt=0), extra (dict, shallow-merged into the request body).\n- output_length becomes Turn.max_tokens.\n- The validator rejects timestamp together with delay, but the check is by truthiness (`if self.timestamp and self.delay`), so timestamp=0 plus delay passes.\n- A leading system turn is hoisted into conversation.system_message only when all of these hold: it is the first turn, it is text-only, it has no timestamp, delay, output_length or extra, and the endpoint consumes system_message (chat does).\n- Hoisting is undone in two cases: the session has no other turns, or the next turn is also role=system.\n- The loader logs this EXPLICITLY at INFO: 'Hoisted leading system turn into system_message for 3/3 conversation(s) (endpoint 'chat')'.\n- Delays pass through DelayCapTracker. They are clamped only when the dataset's inter_turn_delay_cap_seconds is set. Without a cap, any delay > 60 s produces a load-time warning.\n- MultiTurn inherits extra='allow', so unknown top-level keys (e.g. a top-level timestamp) are accepted and ignored by the loader.",
+    "evidence": [
+     "src/aiperf/dataset/loader/models.py:97-120 (fields), 111-115 (output_length gt=0), 132-133 (truthiness check)",
+     "src/aiperf/dataset/loader/multi_turn.py:97-121 (docstring), 191-194 (hoist gated on endpoint), 221-241 (un-hoist cases), 248-252 (INFO log), 281 (max_tokens=single_turn.output_length), 286-329 (_try_hoist_system_message; guard 310-319)",
+     "src/aiperf/dataset/loader/multi_turn.py:136-142,279 and src/aiperf/dataset/loader/_delay_cap.py:19,73-107",
+     "src/aiperf/common/models/base_models.py:19 (extra=\"allow\")",
+     "smoke/run1d/logs/aiperf.log: 'MultiTurnDatasetLoader - INFO - Hoisted leading system turn into system_message for 3/3 conversation(s) (endpoint 'chat')'"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 4: run1 command and default request-count behaviour",
+    "answer": "The run1 command and result are as stated: benchmark_duration 5.365 s, phases=[{type: concurrency, requests: 10, concurrency: 2}], and 10 requests including a second sess-A instance (new x_correlation_id) that was cut off after turn 1. The default of 10 comes from _converter_profiling.py:271-279: every non-fixed_schedule phase with no requests/duration/sessions bound gets `requests=10`. This contradicts the --request-count help text, which says max(10, concurrency*2) and only 'for synthetic datasets'. `--conversation-num N` (aliases --num-conversations, --num-sessions) routes to phases.profiling.sessions (_converter_profiling.py:22), which becomes expected_num_sessions. That stops NEW sessions after N and lets in-flight sessions complete. It worked for multi_turn: sessions=3 gave exactly 9 requests, even though the help text says it applies to synthetic/random_pool. For fixed_schedule, the default instead sets requests to the dataset record count (_converter_profiling.py:371-379). `--tokenizer builtin` is documented as zero-network tiktoken o200k_base.",
+    "evidence": [
+     "src/aiperf/config/flags/_converter_profiling.py:15-24,271-279,371-379",
+     "src/aiperf/timing/config.py:227-228,675-676; src/aiperf/timing/phase/stop_conditions.py:166-193",
+     "run1/profile_export_aiperf.json phases [{'type':'concurrency','requests':10,'concurrency':2}]; run1f phases [{'type':'concurrency','sessions':3,'concurrency':2}]",
+     "run1/profile_export.jsonl: sess-A turns 0,1 with x_correlation_id 1f30637d (second instance)",
+     "aiperf profile --help (scratchpad/verify-empirical-help.txt:149-150,179,241)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 4 (CRITICAL): reliability. Runs without --record-processors stall after profiling",
+    "answer": "Observed: 3 of 4 runs without --record-processors (run1b, run1c, run1d; run1d is byte-identical to run1) did not finish processing records after 'Received credits complete'. /api/progress showed success_records 0 and records_end_ns null, and SIGINT produced 'No profile results to export'. BUT they were SIGINTed 66-132 s after credits complete, so 'hangs forever' was NOT observed.\n\nRoot cause from source plus logs, sharper than the original claim: with record_processor_service_count unset (default None), record processors are spawned later by SPAWN_WORKERS (max(1, workers // 4)). They are not required services. In every stalled run the record processor registered AFTER dataset_manager logged 'Dataset configured' (run1b 33.378 -> RP 33.475; run1c 21.619 -> 21.821; run1d 46.825 -> 46.911). So it missed the one-shot PUB/SUB DatasetConfiguredNotification. In every successful run the record processor registered before it. RecordProcessor._on_inference_results then blocks in await_dataset_configured for up to AIPERF_DATASET_CONFIGURATION_TIMEOUT (default 300 s). After that it should log 'Dataset configuration not received after 300.0s; aborting run', publish an error and kill itself. That end state is inferred, not observed.\n\nThe 'not expecting: record_processor_...' warning is NOT a reliable detector: run1c stalled without it.\n\nWorkaround: `--record-processors N` (alias of --record-processor-service-count, ge=1) makes RECORD_PROCESSOR a required service, so it registers before CONFIGURING. All 5 runs that used it completed: run1e, run1f, run2, run3, run4. Workers still register late, which is harmless here. The wrapper should always pass --record-processors and keep a watchdog.",
+    "evidence": [
+     "src/aiperf/controller/system_controller.py:112-123 (required_services), 591-604 (SPAWN_WORKERS spawns RPs when scaling)",
+     "src/aiperf/config/flags/cli_config.py:4028-4040; src/aiperf/config/runtime.py:32 (default None); src/aiperf/common/environment.py:947-950 (PROCESSOR_SCALE_FACTOR default 4)",
+     "src/aiperf/records/record_processor_service.py:158-168,289 (dataset-configured gate); src/aiperf/records/dataset_gate.py:25-58",
+     "src/aiperf/common/environment.py:299-304 (CONFIGURATION_TIMEOUT default 300.0, env prefix AIPERF_DATASET_)",
+     "src/aiperf/dataset/dataset_manager.py:854,996 (single DatasetConfiguredNotification publish)",
+     "logs: run1 RP 17:03:40.482 < configured 17:03:47.968 (ok); run1e 13.389 < 13.919 (ok); run1f 54.324 < 54.801 (ok); run2 26.893 < 27.410 (ok); run1b/1c/1d RP after configured (stalled)",
+     "run1c.log: RP registered after PROFILING, no 'not expecting' warning, stalled",
+     "run1b.log: credits complete 17:05:40.030, SIGINT 17:07:52.585; run1d: 17:10:52.339 -> 17:11:58.867; run1c: 17:08:28.373 -> 17:10:16.142",
+     "run1b_hung_progress.json: records_end_ns null, success_records 0, requests_end_ns set"
+    ],
+    "confidence": "read-in-source"
+   },
+   {
+    "question": "Step 4: --api-port and live /metrics",
+    "answer": "With --ui none, the realtime publish loop skips every tick unless ui==dashboard or AIPERF_UI_REALTIME_METRICS_ENABLED=true. Without it, /metrics returned only the 4-line aiperf_info gauge. --stats-interval overrides AIPERF_UI_REALTIME_METRICS_INTERVAL (defaults: 5 s under dashboard, 30 s otherwise). Prometheus naming: `aiperf_<tag>_<unit>` is a summary with quantile labels 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, plus `_sum`/`_count`; gauges are `aiperf_<tag>_avg_<unit>`, `_min_`, `_max_`, `_std_`. Labels: benchmark_id, model, endpoint_type, streaming, concurrency. HTTP routes registered in v0.12.0 (api_router plugins core/metrics/progress/results/workers): GET /api/config, /api/run, /healthz, /readyz, /metrics, /api/metrics, /api/progress, /api/results, /api/results/list, /api/results/files/{filename}, /api/workers. There is NO websocket route in v0.12.0, even though the help text and docstrings mention one. The api-process SIGKILL after bus shutdown happened only in runs that passed --api-port (run1, run1e, run1f); runs without it (run2/3/4) had none.",
+    "evidence": [
+     "src/aiperf/records/records_manager.py:1127-1131",
+     "src/aiperf/common/environment.py:1447-1455 (env_prefix AIPERF_UI_), 1481-1495",
+     "src/aiperf/api/routers/core.py:31,42,63,71; metrics.py:75,86; progress.py:41; results.py:96,110,131; workers.py:35",
+     "src/aiperf/plugin/plugins.yaml:142-161 (only 5 api_router entries); grep for '.websocket(' / add_websocket_route in src/aiperf -> none; src/aiperf/api/__init__.py:10 (docstring-only '/ws')",
+     "smoke/run1_api_metrics.txt (4 lines); smoke/run1f_api_metrics_live.txt (803 lines, aiperf_time_to_first_token_ms{...quantile=\"0.95\"}, aiperf_time_to_first_token_avg_ms)",
+     "grep 'still alive' -> run1/run1e/run1f: 1 each; run2/run3/run4: 0"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: artifact files produced",
+    "answer": "With --export-level raw, a completed run's artifact dir contains: inputs.json, logs/aiperf.log, profile_export.jsonl, profile_export_aiperf.json, profile_export_aiperf.csv, profile_export_console.txt, profile_export_raw.jsonl, server_metrics_export.json, server_metrics_export.csv. Server metrics are on by default, scraped from <url>/metrics; --no-server-metrics disables them. Stalled runs left only inputs.json, logs/ and raw_records/. No gpu_telemetry_export.jsonl exists in any smoke artifact dir, so that part of the original claim is unconfirmed. The default --export-level is `records`; summary gives aggregates only; raw adds _raw.jsonl. inputs.json has the shape {\"data\":[{\"session_id\",\"payloads\":[...]}]}, and every payload holds only [system,user] without history.",
+    "evidence": [
+     "cmd: find smoke/run1f -type f; ls smoke/run1b smoke/run1c smoke/run1d",
+     "cmd: find smoke -name 'gpu_telemetry_export*' -> (none)",
+     "aiperf profile --help lines 117-118 ('[choices: summary, records, raw] [default: records]'), 423-425",
+     "smoke/run1f/inputs.json: payload roles ['system','user'] x3, max_completion_tokens 30"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: aggregate JSON (profile_export_aiperf.json) top-level keys and metric entry shape",
+    "answer": "Non-metric keys: schema_version ('1.4'), aiperf_version, benchmark_id, telemetry_data, input_config, run_info, was_cancelled, error_summary, start_time, end_time. Metric entries are keyed by tag.\n- Most distribution metrics have the keys unit, avg, p1, p5, p10, p25, p50, p75, p90, p95, p99, min, max, std, count, sum.\n- Some distribution metrics have a reduced set: effective_concurrency has only unit, avg, p50, p90, p95, p99, min, max, std.\n- Scalars are {unit, avg}.\n- Tags the wrapper needs: time_to_first_token, inter_token_latency, request_latency (E2E, ms), output_token_throughput (tokens/sec), request_throughput (requests/sec), request_count, benchmark_duration (sec), total_osl, total_usage_prompt_tokens, total_usage_prompt_cache_read_tokens, overall_usage_prompt_cache_read_pct.\n- output_token_throughput = total_osl / observation_duration. observation_duration is benchmark_duration (max response ts - min request ts) unless window bounds are set. The reported values match the JSON's own total_osl / benchmark_duration only to about 0.05%: run1f gives 206/6.50917 = 31.648 vs 31.632 reported.\n- The CSV uses display names ('Time to First Token (ms)'), not tags, so parse the JSON.",
+    "evidence": [
+     "run1..run4 profile_export_aiperf.json key dumps (python)",
+     "src/aiperf/metrics/types/output_token_throughput_metrics.py:16-42; src/aiperf/metrics/metric_dicts.py:217-238; src/aiperf/metrics/types/benchmark_duration_metric.py (max_res - min_req)",
+     "run1f/profile_export_aiperf.csv lines 1, 55, 60, 77"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: cache hit % semantics",
+    "answer": "overall_usage_prompt_cache_read_pct = total_usage_prompt_cache_read_tokens / total_usage_prompt_tokens * 100, weighted by token volume (run1 71/182 = 39.01%, run1f 75/183 = 40.98%). The per-request cache-read value comes from Usage.prompt_cache_read_tokens, which for OpenAI-style responses normalizes prompt_tokens_details.cached_tokens. It is computed over the whole run's profiling records. A per-stage value must be recomputed from profile_export.jsonl as sum(metrics.usage_prompt_cache_read_tokens.value) / sum(metrics.usage_prompt_tokens.value).",
+    "evidence": [
+     "src/aiperf/metrics/types/usage_total_metrics.py:320-347",
+     "src/aiperf/metrics/types/usage_cache_metrics.py:8-25,33-56",
+     "run1 JSON: total_usage_prompt_tokens 182, total_usage_prompt_cache_read_tokens 71, overall 39.0110"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: per-request record shape (profile_export.jsonl)",
+    "answer": "Each line is {metadata, metrics, error?}.\n- metadata keys: session_num, x_request_id, x_correlation_id, conversation_id, turn_index, credit_issued_ns, request_start_ns, request_ack_ns (optional; absent on error records), request_end_ns, worker_id, record_processor_id, benchmark_phase, phase_index, profiling_index, phase_name, phase_kind, was_cancelled, context_overflow_skip, agent_depth, root_correlation_id.\n- session_num is credit_num, a per-request counter.\n- conversation_id is the dataset session_id.\n- x_correlation_id is shared by every turn of one session instance and matches the X-Correlation-ID request header.\n- Metrics are {tag: {value, unit}}. inter_chunk_latency.value is a list.\n- Error records carry error {code, type, message} and have EMPTY metrics {}, so no TTFT and no usage.\n- The JSONL writer has no phase filter, so warmup records probably appear with benchmark_phase='warmup' while the aggregate excludes them. This is inferred and untested.",
+    "evidence": [
+     "run1/run2/run4 profile_export.jsonl key dumps; run4 error rows: metrics [] and no request_ack_ns",
+     "src/aiperf/records/record_processor_service.py:258,265 (benchmark_phase, session_num=credit_num)",
+     "src/aiperf/common/models/record_models.py:167-260",
+     "src/aiperf/post_processors/record_export_jsonl_writer.py:22-80 (no phase filter); src/aiperf/records/records_manager.py:717-746; src/aiperf/metrics/accumulator.py:87",
+     "run1f raw: X-Correlation-ID == metadata.x_correlation_id for all 9 requests"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: raw record shape (profile_export_raw.jsonl)",
+    "answer": "Keys: metadata, start_perf_ns, request_headers {User-Agent 'aiperf/0.12.0', X-Request-ID, X-Correlation-ID, Accept 'text/event-stream', Content-Type}, status (HTTP int), responses [{perf_ns, packets:[{name:'data', value:'<SSE JSON or [DONE]>'}]}], payload {messages, model, stream, max_completion_tokens, stream_options}. Error rows additionally carry an error key and an empty responses list. stream_options.include_usage=True is forced only when BOTH --streaming and --use-server-token-count are set, and any author-supplied stream_options keys are kept.",
+    "evidence": [
+     "run1f/profile_export_raw.jsonl first row key dump",
+     "src/aiperf/endpoints/openai_chat.py:74-78,148-159",
+     "run4 raw: error rows status 500, 'error' present, 0 responses"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: is the system message sent on EVERY turn, and does history contain the real prior assistant text?",
+    "answer": "Yes. Every request's messages[0] is the 2102-char persona with role=system, and the role sequences are su / suau / suauau. For every turn > 0 in run1f, the assistant contents equal the concatenated streamed delta.content of that session's earlier responses. The hoisted system_message is prepended only when the rendered history does not already start with a system message. The think delay starts after the previous response ends: credit_issued(t_k) - end(t_{k-1}) and start - end gaps were 499.9-500.5 ms for delay 500.",
+    "evidence": [
+     "re-run analysis of run1f raw: all 9 rows hist_matches_prev_responses=True, gaps 500.4/500.4/500.3/500.1/500.5/499.9",
+     "run1 raw sess-A turns 0-2: ('system', 2102, 'You are Captain Mira Voss')",
+     "src/aiperf/endpoints/openai_chat.py:89-110 (_format_messages)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 5: max tokens field name on the wire",
+    "answer": "`max_completion_tokens` by default; `--use-legacy-max-tokens` switches it to `max_tokens`. The value is turns[-1].max_tokens, i.e. the current turn's output_length, and the field is omitted when that is None. Per-turn `extra` is shallow-merged after endpoint extras.",
+    "evidence": [
+     "src/aiperf/endpoints/openai_chat.py:46-72 (token_field at 61-65)",
+     "src/aiperf/config/flags/cli_config.py:308",
+     "mock_requests.jsonl: 74/74 rows (None, 30)"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Concurrency mode semantics (N active sessions including think time)",
+    "answer": "Confirmed. A 'concurrency' phase runs RequestRateStrategy with ArrivalPattern.CONCURRENCY_BURST. The session slot is acquired only when a session starts (issuer: needs_session_slot = is_session_start and not is_child) and is released at session end, so think time holds the slot. In run1f, sess-C t0 got its credit at 3040.1 ms, right after sess-B's last turn ended at 3039.6 ms. The --concurrency help text says 'concurrent requests', which is misleading for multi-turn. effective_concurrency (avg 1.396 in run1, 1.056 in run1f) measures in-flight requests.",
+    "evidence": [
+     "src/aiperf/timing/config.py:42-60 (CONCURRENCY -> CONCURRENCY_BURST, REQUEST_RATE timing mode)",
+     "src/aiperf/credit/issuer.py:161-165,324-347,384-406",
+     "src/aiperf/timing/strategies/request_rate.py:36-44",
+     "run1f per-record timing: sess-B t2 end=3039.6; sess-C t0 cred=3040.1 start=3041.5"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 6: fixed schedule with multi_turn. Preflight requirement",
+    "answer": "Confirmed. _check_timing_data reads only the FIRST non-empty JSONL line and checks record.get('timestamp') / record.get('delay') at TOP level. _validate_fixed_schedule_timing then raises: 'Phase 'profiling' uses fixed_schedule which requires timestamp or delay fields in the dataset, but dataset 'main' has no timing data in its first record'. The strategy itself needs conversation.turns[0].timestamp_ms, where turns[0] is the first user turn after hoisting. Otherwise it raises 'First turn of X missing timestamp_ms'. So both keys are needed: the top-level timestamp to pass the preflight, and the first user turn's timestamp to drive the schedule. The system turn must carry neither, or it will not be hoisted. Timestamps are auto-offset: the phase default auto_offset is True and the run2 log showed 'auto_offset=True', even though the CLI help says --fixed-schedule-auto-offset [default: False].",
+    "evidence": [
+     "src/aiperf/config/dataset/resolver.py:341-385",
+     "src/aiperf/config/resolution/resolvers.py:388-409",
+     "src/aiperf/timing/strategies/fixed_schedule.py:76-122",
+     "src/aiperf/config/phases.py:666-673 (auto_offset default=True); src/aiperf/timing/config.py:692-694",
+     "smoke/run2_attempt1_nested_ts_only.log error text; smoke/run2/logs/aiperf.log: 'Built schedule with 3 timestamps, zero_ms=0, auto_offset=True'"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 6: what happens when fixed-schedule sessions exceed --concurrency (cap=1)?",
+    "answer": "Sessions are delayed, not dropped. issue_credit awaits acquire_session_slot, so credit_issued_ns is stamped AFTER the slot frees: sess-B t0 credit 3389.8 ms, just after sess-A ended at 3389.2 ms. All 9 requests and 3 sessions completed. The resolved config shows phases [{type:'fixed_schedule', requests:3, concurrency:1}], but the runtime target logged was '9 requests, 3 sessions'. The aggregate adds replay_sched_lag_p50/p90/p99 (ms; 3291/5659/6192) and replay_sched_degraded (count; 1 when anchored p99 lag > 500 ms). These are anchored to the least-late request (offset - min(offset)), not to the absolute schedule. The per-record scheduled send time (replay_send_schedule_offset) is flagged INTERNAL and is not in profile_export.jsonl. Continuation turns honor `delay` (gaps about 501-503 ms). AIPerf has no drop counter.",
+    "evidence": [
+     "src/aiperf/credit/issuer.py:324-347; src/aiperf/timing/strategies/fixed_schedule.py:134-139",
+     "src/aiperf/metrics/types/replay_sched_lag_metrics.py:58 (threshold 500.0), 66-107 (INTERNAL | FIXED_SCHEDULE_ONLY), 151,165,179,195-198",
+     "smoke/run2/logs/aiperf.log: 'target: 9 requests, 3 sessions'; 'complete | completed=9, cancelled=0, errors=0 | sessions: completed=3'; 'Replay schedule degraded: anchored send lag p50=3291 ms, p90=5659 ms, p99=6192 ms exceeds 500 ms'",
+     "run2 per-record: sess-A t2 end=3389.2, sess-B t0 cred=3389.8; sess-B t2 end=6449.2, sess-C t0 cred=6449.7"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Extra: --request-rate + --concurrency cap (candidate for the 'arrival_rate' mode)",
+    "answer": "Confirmed. RequestRateStrategy consumes one rate interval per issued credit. Queued continuation turns take priority 1, new sessions priority 2, and a failed slot acquisition (try_issue_credit -> None) retries at the next tick, so there are no drops. Think time is honored before the continuation is queued, and the turn then waits for a tick. run3 gaps were 502-643 ms for delay 500. Resolved phase: {type:'poisson', sessions:3, concurrency:1, rate:20.0}. --request-rate is a per-turn rate, not a session-start rate. The recommended alternative (wrapper-generated first-turn timestamps + --fixed-schedule + --concurrency cap, with drops computed by the wrapper) is a design inference. The user_centric_rate strategy (gap = num_users / request_rate between a user's turns) was not tested.",
+    "evidence": [
+     "src/aiperf/timing/strategies/request_rate.py:36-38,186-233,272-278",
+     "src/aiperf/plugin/plugins.yaml:913-929",
+     "run3 per-record: A t0 end 668.8 -> t1 cred 1271.4 (602.6); B t1 end 5341.0 -> t2 cred 5984.5 (643.5); C t0 end 7506.1 -> t1 cred 8007.8 (501.7)",
+     "run3 phases [{'type':'poisson','sessions':3,'concurrency':1,'rate':20.0}]"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Extra: how errors appear (for error_rate SLO), and effect on the session",
+    "answer": "run4 (mock --error-rate 30 --random-seed 3) produced these aggregates: request_count 5.0 (successes only), completed_request_count 9.0, error_request_count 4.0, request_error_rate 44.44 (%), and error_summary [{error_details:{code:500, type:'Internal Server Error', message:'{\"detail\":\"Simulated error\"}'}, count:4}]. When there are no errors, error_request_count, request_error_rate AND completed_request_count are all absent (run1, run1f, run2, run3). error_summary is then []. The wrapper must default them to 0 and compute error_rate = errors / (successes + errors). Errored runs also add adj_request_latency, adj_time_to_first_token, adj_inter_token_latency, adj_decode_duration (the console's '(error-adjusted)' rows) and context_overflow_count. The session continues after a failed turn, and the failed user message stays in history with no assistant reply: sess-A t1 roles [system,user,user], sess-C t2 [system,user,user,assistant,user].",
+    "evidence": [
+     "run4/profile_export_aiperf.json metric key list and values",
+     "run1/profile_export_aiperf.json: none of error_request_count/request_error_rate/completed_request_count present; error_summary []",
+     "run4/profile_export_raw.jsonl roles per row",
+     "src/aiperf/metrics/types/request_error_rate_metric.py:24; completed_request_count_metric.py:21; error_request_count.py:19; request_count_metric.py:19",
+     "run4/profile_export_console.txt:88-92 '(error-adjusted)' rows"
+    ],
+    "confidence": "verified-by-run"
+   },
+   {
+    "question": "Step 7: cleanup",
+    "answer": "As of this verification, no aiperf or aiperf-mock-server processes are running and nothing listens on 18000, 18778 or 18901. The processes flagged in the original open issue (PID 47757 system_controller, PID 46011 mock on 18778) are gone.",
+    "evidence": [
+     "cmd: pgrep -fl 'aiperf|mock-server' -> (none)",
+     "cmd: lsof -nP -iTCP:18778 -iTCP:18000 -iTCP:18901 -sTCP:LISTEN -> (none)"
+    ],
+    "confidence": "verified-by-run"
+   }
+  ],
+  "openIssues": [
+   "Record-processor stall (no --record-processors): the source says it should end after AIPERF_DATASET_CONFIGURATION_TIMEOUT (300 s default) with 'Dataset configuration not received after 300.0s; aborting run' and the record processor killing itself. No run was left that long (all were SIGINTed at 66-132 s), so the final behavior (non-zero exit vs. hang) is unverified. Always pass --record-processors N and still enforce a wrapper-side timeout plus process-tree kill. A reliable stall detector: /api/progress phases.<name>.requests_end_ns set while records_end_ns stays null and success_records stays 0, or record-processor registration after 'Dataset configured' in the log. The 'not expecting: record_processor_' warning alone is not reliable (run1c stalled without it).",
+   "Warmup is untested: whether warmup records land in profile_export.jsonl with benchmark_phase='warmup' is inferred from the absence of a phase filter in RecordExportJSONLWriter. How --num-warmup-sessions interacts with multi_turn sequential sampling (it may consume the first dataset sessions) is also untested.",
+   "Drop accounting for the arrival_rate mode: per-record scheduled send time is not exported (replay_send_schedule_offset is INTERNAL). The wrapper must rebuild lag as credit_issued_ns(turn 0) - (anchor + its own scheduled offset). The anchor (phase start) is available as /api/progress start_ns or approximately as the earliest credit_issued_ns, which works with auto_offset=True when the first scheduled timestamp is 0. Not validated.",
+   "output_token_throughput differs from total_osl/benchmark_duration by about 0.05% in the exported JSON. For per-stage recomputation, use total output tokens / (max request_end_ns - min request_start_ns) over the stage's records and expect small differences from AIPerf's figure.",
+   "--inter-turn-delay-cap-seconds: the help says it is honored by the DAG JSONL and baseten_trace loaders, but the multi_turn loader reads inter_turn_delay_cap_seconds from the default dataset config. Whether the CLI flag reaches the multi_turn loader was not verified. Exponential think times over 60 s will trigger an uncapped-delay warning.",
+   "--benchmark-duration stage bounding, comma-list sweeps (several stages in one invocation), user_centric_rate, and a delay on the first user turn in concurrency mode were not exercised.",
+   "CLI help says --custom-dataset-type choices are kebab-case (multi-turn), but multi_turn (underscore) was accepted in every run. The help also calls --fixed-schedule-auto-offset default False, while the effective phase default is auto_offset=True.",
+   "The API advertises 'HTTP + WebSocket endpoints' in --api-port help, but no websocket route is registered in v0.12.0. Do not design the wrapper around a websocket."
+  ],
+  "corrections": [
+   {
+    "question": "Step 3: multi_turn dataset schema",
+    "before": "The loader logged 'Hoisted leading system turn into system_message for 3/3 conversation(s)' implicitly: request count was 9, not 12.",
+    "after": "The loader logs it explicitly at INFO: 'Hoisted leading system turn into system_message for 3/3 conversation(s) (endpoint 'chat')' (multi_turn.py:248-252). Hoisting also requires an endpoint that consumes system_message (multi_turn.py:191-194). The timestamp+delay exclusivity check uses truthiness, so timestamp=0 with delay passes (models.py:132-133). output_length must be > 0.",
+    "reason": "The log line exists in smoke/run1d/logs/aiperf.log and others. Source shows the extra gating and validator nuance."
+   },
+   {
+    "question": "Step 4 (CRITICAL): reliability",
+    "before": "aiperf hangs forever after profiling on a warm start ... Cause: the record processor ... registers after 'AIPerf System is PROFILING' ... 'Received command response for service we were not expecting' ...",
+    "after": "Runs stalled after profiling, and all were SIGINTed after 66-132 s, so 'forever' was not observed. Cause: in every stalled run the auto-spawned record processor registered AFTER dataset_manager published its one-shot DatasetConfiguredNotification, so its dataset gate blocks for up to AIPERF_DATASET_CONFIGURATION_TIMEOUT=300 s (then it should abort; inferred). The 'not expecting' warning did not appear in run1c, which still stalled. --record-processors N remains the working workaround (5/5).",
+    "reason": "Log timestamp comparison ('Dataset configured in' vs 'Registered Record Processor') across 7 runs, plus src/aiperf/records/dataset_gate.py:25-58, record_processor_service.py:158-168,289, environment.py:299-304."
+   },
+   {
+    "question": "Step 4: --api-port and live /metrics",
+    "before": "Other endpoints: /api/metrics, /api/progress, /api/config, /api/results, /api/workers, /healthz, /readyz, and a websocket. The api service is SIGKILLed about 5 s after bus shutdown on every run.",
+    "after": "Registered routes: /api/config, /api/run, /healthz, /readyz, /metrics, /api/metrics, /api/progress, /api/results, /api/results/list, /api/results/files/{filename}, /api/workers. There is no websocket route in v0.12.0. The api SIGKILL happens only on runs started with --api-port.",
+    "reason": "plugins.yaml:142-161 lists only 5 api routers and none defines a websocket (the only '/ws' mention is the api/__init__.py:10 docstring). The 'still alive' warning appears in run1/run1e/run1f but not in run2/run3/run4 (no --api-port)."
+   },
+   {
+    "question": "Step 5: artifact files produced",
+    "before": "gpu_telemetry_export.jsonl only appeared in the hung run.",
+    "after": "No gpu_telemetry_export* file exists in any smoke artifact dir. Stalled runs contain only inputs.json, logs/ and raw_records/.",
+    "reason": "find smoke -name 'gpu_telemetry_export*' returned nothing."
+   },
+   {
+    "question": "Step 5: aggregate JSON metric shape and throughput formula",
+    "before": "Distribution metrics look like {unit, avg, p1..p99, min, max, std, count, sum} ... output_token_throughput = total_osl / benchmark_duration (206/6.509 = 31.63).",
+    "after": "Most distributions have that shape, but some (e.g. effective_concurrency) have only unit, avg, p50, p90, p95, p99, min, max, std. output_token_throughput = total_osl / observation_duration. It matches the exported total_osl/benchmark_duration only to about 0.05% (206/6.50917 = 31.648 vs 31.632 reported).",
+    "reason": "Key dump of run1f JSON; arithmetic check; output_token_throughput_metrics.py:36-42 and metric_dicts.py:217-238."
+   },
+   {
+    "question": "Extra: how errors appear",
+    "before": "When there are no errors, error_request_count and request_error_rate are ABSENT.",
+    "after": "When there are no errors, error_request_count, request_error_rate AND completed_request_count are all absent and error_summary is []. Error runs also add adj_request_latency, adj_time_to_first_token, adj_inter_token_latency, adj_decode_duration and context_overflow_count. Error rows in profile_export.jsonl have metrics {} and no request_ack_ns.",
+    "reason": "Metric key lists of run1/run1f/run2/run3 vs run4, and run4 per-record inspection."
+   },
+   {
+    "question": "Step 6: fixed-schedule overflow and drop computation",
+    "before": "The wrapper would have to compute 'drops' itself, e.g. from start lag vs. scheduled time using credit_issued_ns. Resolved phase requests: 3 ... although 9 requests were sent.",
+    "after": "credit_issued_ns for a queued session start is stamped only after the slot frees (issuer awaits acquire_session_slot), so lag = credit_issued_ns - (phase anchor + scheduled offset). The scheduled time itself is not exported per record (replay_send_schedule_offset is INTERNAL), and replay_sched_lag_* are anchored to min offset. The runtime target was '9 requests, 3 sessions' even though input_config says requests: 3. Timestamps are auto-offset (auto_offset=True by phase default).",
+    "reason": "run2 per-record timings (sess-B t0 cred 3389.8 right after sess-A end 3389.2), run2 log lines, replay_sched_lag_metrics.py:66-107, phases.py:666-673."
+   },
+   {
+    "question": "Step 2: mock flags",
+    "before": "--ttft-per-isl-token-ms (prefill cost that scales with prompt length)",
+    "after": "--ttft-per-isl-token-ms scales with the mock's user-role-only prompt_token_count, so it ignores system-prompt and history length and does not model persona/history prefill cost.",
+    "reason": "tests/aiperf_mock_server/utils.py:423 (isl=tokenized.prompt_token_count) and tokens.py:361-365,418-421 (user-only text)."
+   },
+   {
+    "question": "Step 4: default request count",
+    "before": "Without an explicit bound, aiperf resolved phases requests: 10 (implicitly via help's max(10, concurrency*2) for synthetic).",
+    "after": "The converter unconditionally sets requests=10 for any non-fixed_schedule phase with no requests/duration/sessions (_converter_profiling.py:271-279). For fixed_schedule the default is the dataset record count (lines 371-379). The help text's max(10, concurrency*2) 'for synthetic datasets' does not describe this path.",
+    "reason": "Source of _converter_profiling.py vs cli_config.py:2036 help string."
+   },
+   {
+    "question": "Open issue about foreign processes",
+    "before": "The aiperf tree still running (system_controller PID 47757 ...) and mock on 18778 (PID 46011) need to be killed by their owner.",
+    "after": "These processes are no longer running; no aiperf or mock processes remain and ports 18000/18778/18901 are free.",
+    "reason": "pgrep -fl 'aiperf|mock-server' returned nothing; lsof shows no listeners."
+   }
+  ]
+ }
+]

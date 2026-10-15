@@ -1,0 +1,38 @@
+# 30~50턴까지 이어지는 긴 대화. 히스토리가 쌓여 입력이 1만 토큰대까지 커진다.
+# 대상: max-model-len 32k 이상인 서버(scripts/vllm-linux.sh 기본값). 단계당 5분 30초, 전체 약 11분.
+name: long-context
+seed: 7
+
+target:
+  base_url: http://127.0.0.1:8000/v1
+  model: local-model
+  timeout: 180s
+  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: thinking 끄기
+
+personas:
+  count: 20
+  system_prompt_tokens: {min: 1500, max: 3000}
+
+session:
+  turns: {min: 30, max: 50}
+  user_input_tokens: {dist: lognormal, mean: 40, stddev: 20, min: 5, max: 200}
+  max_output_tokens: {min: 100, max: 250}
+  think_time: {dist: exponential, mean: 5s, min: 1s, max: 30s}
+  persona_selection: zipf
+  zipf_s: 1.1
+
+load:
+  mode: concurrency
+  stages:
+    - {concurrency: 8, duration: 5m, warmup: 30s}
+    - {concurrency: 32, duration: 5m, warmup: 30s}
+
+slo:
+  ttft_p95: 2s
+  itl_p95: 100ms
+  error_rate_max: 0.01
+
+cost:
+  gpu_hourly_usd: 1.09
+  gpu_count: 1
+  label: RunPod L40S
