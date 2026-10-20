@@ -207,12 +207,18 @@ def test_stage_warnings():
         "user_cancelled": 6,
     }  # fmt: skip
     text = "\n".join(stage_warnings(summary))
-    for part in ("3건", "usage 없음: 청크 수로 대체 (4건)", "데이터셋 재사용 발생", "5회",
-                 "1개", "think lag p99 150ms", "에러 턴 뒤 쌍 7개 제외", "시계 보정 의심",
-                 "중단으로 취소된 진행 중 요청 6건"):  # fmt: skip
+    for part in ("3 requests cancelled after the drain",
+                 "no usage: output tokens counted from chunks (4 requests)",
+                 "dataset reused", "5 AIPerf worker CPU warnings", "1 session instances",
+                 "think lag p99 150ms", "7 pairs after an error turn excluded",
+                 "clock skew suspected",
+                 "6 in-flight requests cancelled by the interrupt"):  # fmt: skip
         assert part in text, part
     assert stage_warnings({"status": "ok", "drain_cancelled": 0}) == []
-    assert "drain 취소 미확인" in stage_warnings({"status": "ok", "drain_cancelled": None})[0]
+    assert (
+        "drain cancellations unknown"
+        in stage_warnings({"status": "ok", "drain_cancelled": None})[0]
+    )
 
 
 # --- rendering and compare ---------------------------------------------------------------
@@ -241,7 +247,7 @@ def test_stage_table_concurrency_row():
     assert header.startswith("| stage | conc | active sess | req/s | out tok/s |")
     assert row == (
         "| 01 | 10 | 10.0 (10–10) | 12.35 | 100.0 | 201/251/300 | 25.0/25.3 | 1234 "
-        "| 1.2% | 78.0% (cached 보고 12/13건) | PASS | $2.778 | $0.0225 | $0.225000 |"
+        "| 1.2% | 78.0% (cached reported 12/13) | PASS | $2.778 | $0.0225 | $0.225000 |"
     )
 
 
@@ -261,22 +267,25 @@ def test_stage_table_arrival_censored_partial_and_na():
     assert "| sess/s |" in header
     assert header.endswith("| start lag p50/p95/p99 | queued | not started |")
     assert row.startswith("| 02 (partial) | 5 / 4.40 (10) |")
-    assert "201/251/300 (4건 검열(하한값))" in row
+    assert "201/251/300 (4 censored, lower bound)" in row
     assert row.endswith("| N/A | N/A | N/A | N/A | N/A | 12001/17748/17878 | 11 | 77 |")
 
 
 def test_run_report_and_markdown():
-    failed = {"stage": 3, "status": "failed", "error": "aiperf 종료 코드 2\nlog tail"}
-    report = run_report("demo-1", [_full(1, warnings=["usage 없음: 청크 수로 대체 (4건)"]), failed])
+    failed = {"stage": 3, "status": "failed", "error": "aiperf exit code 2\nlog tail"}
+    report = run_report(
+        "demo-1",
+        [_full(1, warnings=["no usage: output tokens counted from chunks (4 requests)"]), failed],
+    )
     assert report["headline"]["stage"] == 1
     assert report["warnings"] == [
-        "stage 01: usage 없음: 청크 수로 대체 (4건)",
-        "stage 03: failed — aiperf 종료 코드 2",
+        "stage 01: no usage: output tokens counted from chunks (4 requests)",
+        "stage 03: failed — aiperf exit code 2",
     ]
     md = render_markdown(report)
-    assert "# personaload 리포트: demo-1" in md
+    assert "# personaload report: demo-1" in md
     assert "stage 01: $2.778/1M out, $0.0225/1K turns, $0.225000/session (out tok/s" in md
-    assert "| 03 (failed) |" in md and "- stage 03: failed — aiperf 종료 코드 2" in md
+    assert "| 03 (failed) |" in md and "- stage 03: failed — aiperf exit code 2" in md
     only_fail = run_report("x", [_full(1, verdict="FAIL")])
     assert NO_PASSING_STAGE in render_markdown(only_fail)
 
@@ -293,7 +302,7 @@ def test_compare_reads_stage_json_only_and_flags_different_workloads(tmp_path):
     a = _write_run(tmp_path, "naive", [_full(1), _full(2, dataset_sha256="bb")])
     b = _write_run(tmp_path, "vllm", [_full(1, tps=300), _full(2, dataset_sha256="cc")])
     md = compare_markdown([a, b])
-    assert "단계 2의 워크로드가 다름" in md and "단계 1의" not in md
+    assert "stage 2 ran a different workload" in md and "stage 1 ran" not in md
     assert "- naive: stage 01: $2.778/1M out" in md and "- vllm: stage 01:" in md
     assert "| naive | 01 |" in md and "| vllm | 02 |" in md
     assert [s["stage"] for s in load_run(a)] == [1, 2]
@@ -304,8 +313,14 @@ def test_compare_reads_stage_json_only_and_flags_different_workloads(tmp_path):
 def test_compare_rejects_foreign_stage_json_and_names_dot_by_its_directory(tmp_path, monkeypatch):
     bad = _write_run(tmp_path, "bad", [_full(1)])
     (bad / "stage_01" / "stage.json").write_text("{}")
-    with pytest.raises(ReportError, match="형식"):
+    with pytest.raises(ReportError, match="not a stage.json"):
         load_run(bad)
     run = _write_run(tmp_path, "c50-run", [_full(1)])
     monkeypatch.chdir(run)
     assert "- c50-run: stage 01" in compare_markdown([Path(".")])
+
+
+def test_report_on_a_parent_folder_suggests_a_run_directory(tmp_path):
+    _write_run(tmp_path, "smoke-20261016-000000", [_full(1)])
+    with pytest.raises(ReportError, match=r"pass a run directory, e\.g\. .*smoke-20261016-000000"):
+        load_run(tmp_path)

@@ -1,5 +1,7 @@
 # personaload
 
+[![CI](https://github.com/leegun2000/personaload/actions/workflows/ci.yml/badge.svg)](https://github.com/leegun2000/personaload/actions/workflows/ci.yml) ![Python 3.11-3.13](https://img.shields.io/badge/python-3.11--3.13-blue) ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green)
+
 **English** | [한국어](README.ko.md)
 
 personaload load-tests OpenAI-compatible LLM servers (vLLM, SGLang, llama.cpp server, ...) with **chatbot-shaped traffic**: AI character chat and RAG assistants. It reports latency, throughput, prefix-cache hit rate and **cost at your latency SLO**: `$/1M output tokens`, `$/1K turns` and `$/session` at the fastest stage that still passes the SLO.
@@ -13,18 +15,21 @@ Why another benchmark? Real chat traffic is not a stream of independent prompts.
   - session-level arrivals (fixed concurrency or Poisson)
   - optional per-turn retrieved documents (RAG)
 - **Measurement:** [AIPerf](https://github.com/ai-dynamo/aiperf) 0.12.0 generates the load and records every request. personaload generates the datasets, runs the stages, computes the report from per-request records, and ships a mock server for testing.
-- **Example result:** on an Apple M5 Pro with vLLM Metal, enabling prefix caching cut `$/1M out` at the same SLO by 47–73% (Qwen3 0.6B–4B, 5 shared personas). With 500 distinct personas it still cut it by 38–53%. See [docs/cache-savings-m5.md](docs/cache-savings-m5.md) (Korean).
-- **Language note:** the generated report (`report.md`), CLI messages and the design spec ([SPEC_B.md](SPEC_B.md)) are currently in Korean. Numbers and table headers are the same in any language.
+- **Example result:** single runs on an Apple M5 Pro with vLLM Metal, Qwen3 0.6B–4B (MLX 4-bit), short 32–96-token replies, concurrency steps 2/4/8/16. Turning prefix caching **off** raised `$/1M out` at the same SLO by 1.9–3.8× with 5 shared personas and 1.6–2.1× with 500 personas; put the other way, caching saved 47–73% and 38–53%. vLLM enables prefix caching by default, so read this as what caching is worth (and what disabling or evicting it costs), and expect smaller gaps on datacenter GPUs. Details: [docs/cache-savings-m5.md](docs/cache-savings-m5.md).
+- **Language note:** the CLI, `report.md` and handoff documents are in English. The measurement notes behind the example result are in English; the design spec ([SPEC_B.md](SPEC_B.md)) and the prior-art survey ([docs/prior-art.md](docs/prior-art.md)) are in Korean.
 
 ## Install
 
 Requires Python 3.11–3.13 (an AIPerf constraint). Runs on macOS (arm64) and Linux (amd64, arm64).
 
 ```bash
+git clone https://github.com/leegun2000/personaload && cd personaload
 python3.12 -m venv .venv            # any of 3.11–3.13 (macOS: brew install python@3.12)
 .venv/bin/pip install -e .          # for development: pip install -e ".[dev]"
 source .venv/bin/activate
 ```
+
+- Use a dedicated virtual environment. AIPerf pins its dependencies tightly and pulls in a large stack; the environment is about 0.9 GB.
 
 - AIPerf 0.12.0 is installed with it. `personaload run` refuses to start with any other version.
 - The first run downloads the tiktoken `o200k_base` encoding once for token counting. Offline, pre-fill `TIKTOKEN_CACHE_DIR`.
@@ -40,25 +45,27 @@ personaload mockserver                    # 127.0.0.1:8000, TTFT 200ms, 40 tok/s
 
 ```bash
 personaload validate scenarios/smoke.yaml # resolved defaults, sessions and file sizes per stage, AIPerf command
-personaload run scenarios/smoke.yaml      # about 50 seconds
+personaload run scenarios/smoke.yaml      # about 1 minute (the first run also downloads a tokenizer file)
 ```
 
-When it finishes, `results/smoke-<timestamp>/report.md` holds the stage table and the headline. The `**헤드라인**` line is the headline.
+Each stage prints a progress line. When it finishes, `results/smoke-<timestamp>/report.md` holds the headline and the stage table.
 
 ```
-**헤드라인**: stage 02: $0.000/1M out, $0.0000/1K turns, $0.000000/session (out tok/s 63.2, SLO PASS)
+**Headline**: stage 02: $0.000/1M out, $0.0000/1K turns, $0.000000/session (out tok/s 63.2, SLO PASS)
 
-| stage | conc | active sess | req/s | out tok/s | TTFT p50/p95/p99 | ITL p50/p95 | E2E p95 | err% | cache hit% | SLO | $/1M out | $/1K turns | $/session |
+| stage | conc | active sess | req/s | out tok/s | TTFT p50/p95/p99 (ms) | ITL p50/p95 (ms) | E2E p95 (ms) | err% | cache hit% | SLO | $/1M out | $/1K turns | $/session |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 01 | 2 | 2.0 (2–2) | 0.73 | 39.3 | 201/202/202 | 25.0/26.0 | 2089 | 0.0% | 68.6% (cached 보고 11/11건) | PASS | $0.000 | $0.0000 | $0.000000 |
-| 02 | 4 | 4.0 (4–4) | 1.33 | 63.2 | 201/202/202 | 25.0/26.0 | 2284 | 0.0% | 84.5% (cached 보고 20/20건) | PASS | $0.000 | $0.0000 | $0.000000 |
+| 01 | 2 | 2.0 (2–2) | 0.73 | 39.3 | 201/202/202 | 25.0/26.0 | 2089 | 0.0% | 68.6% (cached reported 11/11) | PASS | $0.000 | $0.0000 | $0.000000 |
+| 02 | 4 | 4.0 (4–4) | 1.33 | 63.2 | 201/201/202 | 25.0/26.0 | 2283 | 0.0% | 84.5% (cached reported 20/20) | PASS | $0.000 | $0.0000 | $0.000000 |
 ```
 
-Costs are `$0` here because `smoke.yaml` sets `gpu_hourly_usd: 0` for a local machine. `cached 보고 11/11건` means "11 of 11 requests reported cached tokens".
+Costs are `$0` here because `smoke.yaml` sets `gpu_hourly_usd: 0` for a local machine. `cached reported 11/11` means all 11 requests reported cached tokens. If nothing listens at `target.base_url`, `run` stops before the first stage and says so.
 
 Mock server options: `--ttft`, `--tps`, `--jitter`, `--error-rate` (HTTP 500 share), `--cache-ttft-factor` (TTFT multiplier on a prefix-cache hit), `--no-usage`, `--seed`. The same seed and request always give the same output length and error outcome.
 
 ## llama.cpp on a Mac
+
+The launch scripts below also listen on port 8000, so stop the mock server first.
 
 ```bash
 brew install llama.cpp
@@ -77,16 +84,18 @@ personaload run scenarios/smoke.yaml
 
 ## vLLM on a GPU server
 
+This section assumes Linux with an NVIDIA GPU.
+
 ```bash
 python -m venv ~/vllm && ~/vllm/bin/pip install vllm    # a separate venv from personaload
 PATH=~/vllm/bin:$PATH scripts/vllm-linux.sh              # default Qwen/Qwen3-8B, max-model-len 32768
 ```
 
 - The script enables `--enable-prompt-tokens-details`, so responses report cached tokens and the report can show cache hit%.
-- It binds to `127.0.0.1` by default. To load it from another machine, start it with `HOST=0.0.0.0`. There is no authentication, so use a trusted network only.
-- Qwen3 thinks by default and can spend a short `max_tokens` entirely on reasoning. For chat traffic, add `extra_body: {chat_template_kwargs: {enable_thinking: false}}` to the scenario (the examples have it as a comment).
+- It binds to `127.0.0.1` by default. To load it from another machine, start it with `HOST=0.0.0.0` and set `target.base_url` in the scenario to that machine's address. There is no authentication, so use a trusted network only.
+- Qwen3 thinks by default and can spend a short `max_tokens` entirely on reasoning (measured with smoke.yaml: 48 of 48 replies hit the limit; 30 of 55 after turning thinking off). For chat traffic, add `extra_body: {chat_template_kwargs: {enable_thinking: false}}` to the scenario (the examples have it as a comment).
 
-On Apple Silicon, the same script works with [vllm-metal](https://github.com/vllm-project/vllm-metal), vLLM's Metal/MLX plugin, using MLX-format models (`mlx-community/*`):
+On Apple Silicon, the same `scripts/vllm-linux.sh` works (despite its name) with [vllm-metal](https://github.com/vllm-project/vllm-metal), vLLM's Metal/MLX plugin, using MLX-format models (`mlx-community/*`):
 
 ```bash
 brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
@@ -101,7 +110,7 @@ MODEL=mlx-community/Qwen3-0.6B-4bit MAX_LEN=8192 scripts/vllm-linux.sh
 | [smoke.yaml](scenarios/smoke.yaml) | 3 personas, 2–4 turns, concurrency 2 and 4 | ~1 min |
 | [persona-shared.yaml](scenarios/persona-shared.yaml) | 5 personas shared with Zipf popularity, 5–30 turns, concurrency 10/50/200, Prometheus on 9090 | ~12 min |
 | [persona-diverse.yaml](scenarios/persona-diverse.yaml) | 500 personas used evenly; otherwise the same as persona-shared | ~12 min |
-| [long-context.yaml](scenarios/long-context.yaml) | 30–50 turns, history grows into the 10k-token range, concurrency 8 and 32 | ~11 min |
+| [long-context.yaml](scenarios/long-context.yaml) | 30–50 turns, history grows to ~11k tokens on average (up to ~25k), concurrency 8 and 32 | ~11 min |
 | [rag-assistant.yaml](scenarios/rag-assistant.yaml) | RAG support chatbot: one shared instruction prompt, a 800–2000-token retrieved document every turn, `$/session` as cost per conversation | ~11 min |
 
 ## Comparing runs and handing off to a coding agent
@@ -134,8 +143,8 @@ curl -s http://127.0.0.1:9090/metrics | grep aiperf_time_to_first_token_ms
   - `aiperf_inter_token_latency_ms`, `aiperf_request_latency_ms`
   - `aiperf_output_token_throughput_avg_tps`, `aiperf_request_throughput_avg_requests_per_sec`
   - `aiperf_request_error_rate_avg_percent`, `aiperf_overall_usage_prompt_cache_read_pct_avg_percent`
-- **Updates and stages:** values update every 5 seconds. Each stage runs its own AIPerf process, so the endpoint drops briefly between stages; the `benchmark_id` label tells the stages apart. If the port is already taken, the run stops before the first stage.
-- **Differences from the report:** live values include the warmup. The live inter-token latency is a per-request mean, unlike the report's pooled chunk gaps.
+- **Updates and stages:** values update every 5 seconds, and AIPerf's API shutdown adds a few seconds per stage. Each stage runs its own AIPerf process, so the endpoint drops briefly between stages; the `benchmark_id` label tells the stages apart. If the port is already taken, the run stops before the first stage.
+- **Differences from the report:** live values include the warmup, and the error-rate metric is absent while there are no errors. The live inter-token latency is a per-request mean, unlike the report's pooled chunk gaps. Active sessions are computed only in the report.
 
 ## Scenario fields and defaults
 
@@ -145,7 +154,7 @@ The full example is in [SPEC_B.md §6](SPEC_B.md). Durations look like `500ms`, 
 |---|---|---|
 | `name`, `seed` | results directory name; workload seed (same seed, byte-identical datasets) | `name` required, `seed` 0 |
 | `target.base_url`, `target.model` | OpenAI-compatible endpoint and model name | required |
-| `target.api_key_env` | environment variable holding the API key (masked as `***` in result files) | none |
+| `target.api_key_env` | environment variable holding the API key (masked as `***` in result files; `run` stops if it is empty) | none |
 | `target.timeout` | request timeout | 120s |
 | `target.tokenizer` | AIPerf tokenizer | `builtin` (o200k_base) |
 | `target.max_tokens_field` | `max_completion_tokens` or `max_tokens` | `max_completion_tokens` |
@@ -166,6 +175,9 @@ The full example is in [SPEC_B.md §6](SPEC_B.md). Durations look like `500ms`, 
 | `output.prometheus_port`, `prometheus_host` | live `/metrics` | none (off), `127.0.0.1` |
 | `output.record_requests` | if false, request record files are deleted after each stage (`stage.json` stays) | true |
 
+- `think_time` needs a `max` unless it is `constant`.
+- A relative `personas.file` is resolved against the current directory, not the scenario file's directory.
+
 `personaload validate` reports rule violations as errors and suspicious settings as warnings. Examples of warnings: `think_time.max > 60s`, or `drain_timeout < target.timeout`.
 
 ## How it measures
@@ -180,10 +192,10 @@ The report is computed from **per-request records** (`profile_export.jsonl`), no
 - **Throughput (req/s, out tok/s):** successful requests that **ended** in `[W, E_eff)`, divided by `E_eff − W`.
 - **TTFT, E2E:** AIPerf values, p50/p90/p95/p99 with linear interpolation.
 - **ITL:** the pooled distribution of gaps between SSE chunks that carry data, across all included requests. AIPerf's per-request mean `inter_token_latency` goes into the JSON for reference only.
-- **Error rate:** errors ÷ (successes + errors). Requests cancelled after the drain leave no record, so they are counted from the log and added in. Latency percentiles are then marked as censored lower bounds.
+- **Error rate:** errors ÷ (successes + errors). Requests cancelled after the drain (c of them) leave no record, so they are counted from the log: (errors + c) ÷ (successes + errors + c). Latency percentiles are then marked as censored lower bounds.
 - **Cache hit%:** Σ cached tokens ÷ Σ prompt tokens over successful requests whose usage has prompt tokens. The report also shows how many requests reported cached tokens at all.
 - **Servers without usage:** output tokens fall back to the chunk count, with a warning. Prompt tokens and cache hit% become N/A.
-- **Active sessions:** the time-weighted mean, min and max of open session instances. A session runs from its turn-0 issue to its last turn's end.
+- **Active sessions:** the time-weighted mean, min and max of open session instances. A session runs from its turn-0 issue to its last turn's end; a session cut off at the end of a stage counts as holding its slot to the end.
 - **SLO:** `TTFT p95 ≤ slo.ttft_p95`, `ITL p95 ≤ slo.itl_p95`, `error rate ≤ slo.error_rate_max`. Any known value over its limit gives FAIL. No violation but some value unknown gives N/A. Otherwise PASS.
 - **Warnings:**
   - dataset reuse
@@ -228,6 +240,11 @@ results/<name>-<YYYYmmdd-HHMMSS>/
   - skips the remaining stages, and exits with code 130
   - SIGTERM and SIGHUP behave the same.
 - **A second Ctrl+C** kills AIPerf at once.
+
+## Other commands
+
+- `personaload gen <scenario> --out DIR` writes only the per-stage AIPerf datasets (`stage_NN/dataset.jsonl`).
+- `personaload --version`, and `--log-level DEBUG|INFO|WARNING|ERROR` before the subcommand.
 
 ## Development
 

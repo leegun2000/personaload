@@ -68,13 +68,13 @@ def test_normal_exit_passes_exit_code_through(tmp_path):
 
 def test_startup_watchdog(tmp_path):
     outcome, elapsed = _run(tmp_path, SLEEP, startup=0.5)
-    assert outcome.watchdog.startswith("기동 워치독")
+    assert outcome.watchdog.startswith("startup watchdog")
     assert outcome.t_stop_ns is not None and elapsed < 5
 
 
 def test_run_watchdog_counts_from_profiling_mark(tmp_path):
     outcome, elapsed = _run(tmp_path, MARK_THEN_SLEEP, budget=0.5, startup=0.3)
-    assert outcome.watchdog.startswith("실행 워치독")  # startup 0.3 s did not fire: mark was seen
+    assert outcome.watchdog.startswith("run watchdog")  # startup 0.3 s did not fire: mark was seen
     assert elapsed < 5
 
 

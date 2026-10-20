@@ -48,19 +48,19 @@ class MockConfig:
     def __post_init__(self) -> None:
         errors = []
         if not 0 <= self.jitter < 1:
-            errors.append("jitter는 0 이상 1 미만이어야 한다")
-        if not self.tps > 0:
-            errors.append("tps는 0보다 커야 한다")
-        if not self.ttft_ms >= 0:
-            errors.append("ttft는 0 이상이어야 한다")
-        if not self.cache_ttft_factor >= 0:
-            errors.append("cache-ttft-factor는 0 이상이어야 한다")
+            errors.append("jitter must be in [0, 1)")
+        if not (self.tps > 0 and math.isfinite(self.tps)):
+            errors.append("tps must be a finite number > 0")
+        if not (self.ttft_ms >= 0 and math.isfinite(self.ttft_ms)):
+            errors.append("ttft must be a finite number >= 0")
+        if not (self.cache_ttft_factor >= 0 and math.isfinite(self.cache_ttft_factor)):
+            errors.append("cache-ttft-factor must be a finite number >= 0")
         if self.error_rate > 1:
-            errors.append("error-rate는 비율(0~1)이다. AIPerf mock의 백분율과 다르다")
+            errors.append("error-rate is a fraction (0-1), not a percentage like AIPerf's mock")
         elif not self.error_rate >= 0:
-            errors.append("error-rate는 0 이상이어야 한다")
+            errors.append("error-rate must be >= 0")
         if not 1 <= self.port <= 65535:
-            errors.append("port는 1~65535여야 한다")
+            errors.append("port must be 1-65535")
         if errors:
             raise ValueError("\n".join(errors))
 
@@ -108,7 +108,7 @@ def output_budget(body: dict[str, Any], seed: int, req_hash: str) -> tuple[int, 
     if cap is None:
         cap = DEFAULT_MAX_TOKENS
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-        raise BadRequest("max_completion_tokens/max_tokens는 1 이상의 정수여야 한다")
+        raise BadRequest("max_completion_tokens/max_tokens must be an integer >= 1")
     if body.get("ignore_eos"):
         return cap, cap
     low = math.ceil(cap / 2)
@@ -124,14 +124,14 @@ def should_fail(config: MockConfig, req_hash: str) -> bool:
 
 def _parse_messages(body: Any) -> list[Message]:
     if not isinstance(body, dict):
-        raise BadRequest("요청 본문은 JSON 객체여야 한다")
+        raise BadRequest("the request body must be a JSON object")
     messages = body.get("messages")
     if (
         not isinstance(messages, list)
         or not messages
         or not all(isinstance(m, dict) for m in messages)
     ):
-        raise BadRequest("messages는 비어 있지 않은 메시지 객체 목록이어야 한다")
+        raise BadRequest("messages must be a non-empty list of message objects")
     for message in messages:
         content = message.get("content")
         if isinstance(content, list) and any(
@@ -140,9 +140,9 @@ def _parse_messages(body: Any) -> list[Message]:
             and not isinstance(part.get("text"), str)
             for part in content
         ):
-            raise BadRequest("text 파트의 text는 문자열이어야 한다")
+            raise BadRequest("a text part's text must be a string")
     if not isinstance(body.get("stream_options"), dict | None):
-        raise BadRequest("stream_options는 객체여야 한다")
+        raise BadRequest("stream_options must be an object")
     return messages
 
 
@@ -261,7 +261,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     except (ValueError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         return _error(
             400,
-            str(exc) if isinstance(exc, BadRequest) else "JSON 파싱 실패",
+            str(exc) if isinstance(exc, BadRequest) else "invalid JSON",
             "invalid_request_error",
         )
     if should_fail(config, req_hash):
@@ -310,7 +310,7 @@ def parse_listen(value: str) -> tuple[str, int]:
     host, sep, port = value.rpartition(":")
     if not sep or not host or not port.isdigit():
         raise ValueError(
-            "--listen은 host:port 형식이다 (예: 127.0.0.1:8000, 모든 인터페이스는 0.0.0.0:8000)"
+            "--listen takes host:port (e.g. 127.0.0.1:8000; all interfaces: 0.0.0.0:8000)"
         )
     return host.strip("[]"), int(port)
 

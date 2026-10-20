@@ -79,13 +79,13 @@ def load_records(path: Path) -> list[Record]:
             if raw.get("metadata", {}).get("benchmark_phase", "profiling") == "profiling":
                 records.append(_record(raw))
     if bad:
-        log.warning("%s: 읽지 못한 줄 %d개를 건너뛰었다", path, bad)
+        log.warning("%s: skipped %d unreadable lines", path, bad)
     return records
 
 
 @dataclass(frozen=True)
 class Cancellations:
-    drain: int | None  # cancelled after drain_timeout; None = line not found (미확인)
+    drain: int | None  # cancelled after drain_timeout; None = line not found (unknown)
     user: int | None  # cancelled by Ctrl+C (partial stage)
 
 

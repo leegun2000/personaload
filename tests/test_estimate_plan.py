@@ -40,7 +40,7 @@ def test_warns_when_drain_shorter_than_timeout():
 
 def test_warns_when_clamping_moves_mean():
     checks = _checks(session={"think_time": {"dist": "exponential", "mean": "10s", "max": "5s"}})
-    assert any("session.think_time" in w and "클램프" in w for w in checks.warnings)
+    assert any("session.think_time" in w and "clamped" in w for w in checks.warnings)
 
 
 def test_error_on_tiny_session_think_time():

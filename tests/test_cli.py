@@ -16,9 +16,9 @@ def test_validate_prints_resolved_scenario_and_estimates(scenario_file, capsys):
     assert main(["validate", str(scenario_file())]) == 0
     out = capsys.readouterr().out
     assert "drain_timeout: 2m" in out
-    assert "# 분포 평균" in out
+    assert "# distribution means" in out
     assert "session.think_time: 2s →" in out
-    assert "stage 01: 세션" in out
+    assert "stage 01: sessions" in out
     assert "python -m aiperf profile" in out and "--concurrency=4" in out
 
 
@@ -33,7 +33,7 @@ def test_validate_masks_api_key(scenario_file, capsys, monkeypatch):
 
 def test_validate_reports_errors(scenario_file, capsys):
     assert main(["validate", str(scenario_file(slo={"error_rate_max": 2}))]) == 1
-    assert "오류: slo.error_rate_max" in capsys.readouterr().err
+    assert "error: slo.error_rate_max" in capsys.readouterr().err
 
 
 def test_validate_reports_workload_errors_and_warnings(scenario_file, capsys):
@@ -42,8 +42,8 @@ def test_validate_reports_workload_errors_and_warnings(scenario_file, capsys):
     )
     assert main(["validate", str(path)]) == 1
     err = capsys.readouterr().err
-    assert "경고: load.drain_timeout" in err
-    assert "오류: load.stages.0" in err
+    assert "warning: load.drain_timeout" in err
+    assert "error: load.stages.0" in err
 
 
 def test_validate_reports_persona_file_errors(scenario_file, capsys, tmp_path):
@@ -156,7 +156,22 @@ def test_report_compares_directories_and_rejects_empty_ones(tmp_path, capsys):
         (tmp_path / name / "stage_01" / "stage.json").write_text(json.dumps(stage))
     assert main(["report", str(tmp_path / "a"), str(tmp_path / "b")]) == 0
     out = capsys.readouterr().out
-    assert "- a: SLO를 통과한 단계 없음" in out and "| b | 01 | 4 |" in out
+    assert "- a: no stage passed the SLO" in out and "| b | 01 | 4 |" in out
     (tmp_path / "empty").mkdir()
     assert main(["report", str(tmp_path / "empty")]) == 1
-    assert "stage.json이 없다" in capsys.readouterr().err
+    assert "no stage_*/stage.json" in capsys.readouterr().err
+
+
+def test_huge_synthetic_persona_pool_is_rejected_before_it_is_built(scenario_file, capsys):
+    path = scenario_file(
+        personas={"count": 10_000_000, "system_prompt_tokens": {"min": 1000, "max": 1000}}
+    )
+    assert main(["validate", str(path)]) == 1
+    assert "GiB of synthetic personas" in capsys.readouterr().err
+
+
+def test_gen_into_a_file_is_a_clean_error(scenario_file, tmp_path, capsys):
+    blocker = tmp_path / "taken"
+    blocker.write_text("x")
+    assert main(["gen", str(scenario_file()), "--out", str(blocker)]) == 1
+    assert "error: --out" in capsys.readouterr().err

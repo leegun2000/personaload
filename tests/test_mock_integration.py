@@ -60,7 +60,9 @@ def mock_server(*flags: str, hash_seed: str = "0", log: Path | None = None):
                 time.sleep(0.1)
         yield port
     finally:
-        os.killpg(proc.pid, signal.SIGTERM)
+        # the group may already be gone: Linux raises ProcessLookupError, macOS EPERM
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(10)
 
 
@@ -97,7 +99,7 @@ def test_cli_rejects_bad_arguments():
         text=True,
         timeout=30,
     )
-    assert proc.returncode == 1 and "비율(0~1)" in proc.stderr
+    assert proc.returncode == 1 and "fraction (0-1)" in proc.stderr
 
 
 def test_same_seed_same_outcomes_after_restart():
@@ -215,4 +217,4 @@ def test_port_in_use_is_a_clean_error():
             timeout=30,
         )
     assert proc.returncode == 1
-    assert "시작하지 못했다" in proc.stderr and "Traceback" not in proc.stderr
+    assert "could not start" in proc.stderr and "Traceback" not in proc.stderr

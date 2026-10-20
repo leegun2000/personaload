@@ -49,7 +49,7 @@ def _active_cell(s: dict) -> str:
 def _ttft_cell(s: dict) -> str:
     cell = _quantiles(s, "ttft_ms", ("p50", "p95", "p99"), ".0f")
     censored = s.get("drain_cancelled")
-    return f"{cell} ({censored}건 검열(하한값))" if censored else cell
+    return f"{cell} ({censored} censored, lower bound)" if censored else cell
 
 
 def _cache_cell(s: dict) -> str:
@@ -58,7 +58,7 @@ def _cache_cell(s: dict) -> str:
         return NA
     rate = cache.get("rate")
     shown = NA if rate is None else f"{rate * 100:.1f}%"
-    return f"{shown} (cached 보고 {cache['reported']}/{cache['eligible']}건)"
+    return f"{shown} (cached reported {cache['reported']}/{cache['eligible']})"
 
 
 def _usd(v: float | None, digits: int) -> str:
@@ -98,8 +98,8 @@ def stage_table(rows: Sequence[tuple[str | None, dict]]) -> str:
     modes = {s.get("mode") == ARRIVAL for _, s in rows}
     arrival = True in modes
     load = "load" if len(modes) > 1 else "sess/s" if arrival else "conc"
-    header = ["stage", load, "active sess", "req/s", "out tok/s", "TTFT p50/p95/p99",
-              "ITL p50/p95", "E2E p95", "err%", "cache hit%", "SLO", "$/1M out",
+    header = ["stage", load, "active sess", "req/s", "out tok/s", "TTFT p50/p95/p99 (ms)",
+              "ITL p50/p95 (ms)", "E2E p95 (ms)", "err%", "cache hit%", "SLO", "$/1M out",
               "$/1K turns", "$/session"]  # fmt: skip
     if arrival:
         header += ["start lag p50/p95/p99", "queued", "not started"]
@@ -131,7 +131,7 @@ def run_warnings(stages: Sequence[dict]) -> list[str]:
         prefix = f"stage {s['stage']:02d}: "
         if s.get("status") == "failed":
             first = (s.get("error") or "").splitlines()[:1]
-            warnings.append(prefix + "failed — " + (first[0] if first else "원인 미상"))
+            warnings.append(prefix + "failed — " + (first[0] if first else "unknown cause"))
         warnings += [prefix + w for w in s.get("warnings", [])]
     return warnings
 
@@ -149,11 +149,11 @@ def run_report(run_name: str, stages: Sequence[dict]) -> dict:
 def render_markdown(report: dict) -> str:
     stages = report["stages"]
     parts = [
-        f"# personaload 리포트: {report['run']}",
-        f"**헤드라인**: {headline_text(report['headline'])}",
-        stage_table([(None, s) for s in stages]) if stages else "실행된 단계 없음",
-        "## 경고",
-        "\n".join(f"- {w}" for w in report["warnings"]) or "없음",
+        f"# personaload report: {report['run']}",
+        f"**Headline**: {headline_text(report['headline'])}",
+        stage_table([(None, s) for s in stages]) if stages else "no stage ran",
+        "## Warnings",
+        "\n".join(f"- {w}" for w in report["warnings"]) or "none",
     ]
     return "\n\n".join(parts) + "\n"
 

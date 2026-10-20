@@ -23,15 +23,16 @@ LOW_CACHE_HIT = 0.5
 MIN_REQUESTS_FOR_P95 = 20  # below this, p95 is set by the top one or two requests
 
 INTRO = (
-    "이 문서는 `personaload report --handoff`가 측정 결과에서 자동으로 만든 작업 지시서다. "
-    "다른 세션의 코딩 에이전트가 이 문서만 보고 작업할 수 있게 썼다.\n\n"
-    "- personaload는 캐릭터챗 형태의 합성 대화(공유 페르소나, 쌓이는 히스토리)로 OpenAI 호환 "
-    "서버에 부하를 걸고, SLO(TTFT·ITL p95, 에러율)를 지키는 최대 처리량 기준으로 출력 토큰 "
-    "100만 개당 비용을 잰다.\n"
-    "- 프롬프트는 personaload가 만든 것이다. 그래서 아래 할 일은 **서버·엔진·모델 설정**을 "
-    "가리킨다. 서비스 자체의 프롬프트 조립은 재지 않았다.\n"
-    "- SLO: TTFT p95(첫 토큰까지 시간), ITL p95(스트리밍 청크 간격), 에러율의 상한. "
-    "하나라도 넘으면 그 단계는 FAIL이다."
+    "This document is a work order that `personaload report --handoff` generated from measured "
+    "results. It is written so that a coding agent in another session can act on it alone.\n\n"
+    "- personaload loads an OpenAI-compatible server with synthetic chat sessions (shared "
+    "personas or instructions, growing history, optional retrieved documents) and reports the "
+    "cost per 1M output tokens, per 1K turns and per session at the fastest load that still "
+    "meets the SLO (TTFT and ITL p95, error rate).\n"
+    "- personaload built the prompts, so the tasks below point at **server, engine and model "
+    "settings**. The service's own prompt assembly was not measured.\n"
+    "- SLO: upper limits on TTFT p95 (time to first token), ITL p95 (gap between streamed chunks) "
+    "and the error rate. A stage that exceeds any of them is FAIL."
 )
 
 
@@ -45,77 +46,84 @@ class Rule:
 
 RULES = {  # tasks are listed in this order
     "failed": Rule(
-        "단계 실패",
-        "대상 서버가 응답하지 않거나, 단계의 요청이 모두 실패했거나, AIPerf 설정 오류다.",
-        "그 단계 디렉터리의 `aiperf/logs/aiperf.log`와 `aiperf.console.log` 끝부분에서 원인을 "
-        "찾는다. 서버가 떠 있고 `/v1/chat/completions`에 응답하는지 먼저 확인한다.",
-        "같은 시나리오로 다시 재서 그 단계가 ok로 끝나면 완료.",
+        "Stage failed",
+        "The target server did not respond, every request of the stage failed, or AIPerf was "
+        "misconfigured.",
+        "Look for the cause at the end of `aiperf/logs/aiperf.log` and `aiperf.console.log` "
+        "in that "
+        "stage directory. First check that the server is up and answers `/v1/chat/completions`.",
+        "Re-measure with the same scenario. Done when that stage ends with status ok.",
     ),
     "unjudged": Rule(
-        "SLO를 판정할 수 없다 (측정 구간에 끝난 요청이 없거나 중단된 단계)",
-        "측정 구간(warmup 뒤 duration) 안에서 시작해 끝난 요청이 없다. 요청 하나가 구간보다 "
-        "오래 걸렸거나(서버 포화, target.timeout에 걸렸을 수 있다), 단계가 중단됐다(partial). "
-        "응답이 모두 한 청크뿐이면 ITL을 잴 수 없어 N/A가 되기도 한다.",
-        "그 단계의 `aiperf/profile_export.jsonl`에서 `request_latency`와 `error`를 확인한다. "
-        "포화라면 그 부하에서 서버가 한계에 닿은 것이다. 목표 부하가 그보다 높으면 서버·모델·"
-        "장비를 키우고, 아니면 duration을 늘려 다시 잰다. 중단된 단계는 끝까지 다시 잰다.",
-        "다시 재서 그 단계가 PASS 또는 FAIL로 판정되면 완료.",
+        "SLO cannot be judged (no request finished in the measured window, or the stage was cut)",
+        "No request both started and finished inside the measured window (duration after the "
+        "warmup). A single request took longer than the window (the server may be saturated, or "
+        "hit target.timeout), or the stage was interrupted (partial). ITL is also N/A when every "
+        "response arrived as a single chunk.",
+        "Check `request_latency` and `error` in that stage's `aiperf/profile_export.jsonl`. If the "
+        "server is saturated, this load is its limit: for a higher target load, scale the server, "
+        "model or hardware; otherwise lengthen duration and re-measure. Re-run interrupted stages "
+        "to the end.",
+        "Re-measure. Done when the stage is judged PASS or FAIL.",
     ),
     "ttft_p95": Rule(
-        "첫 토큰이 늦다 (TTFT p95 초과)",
-        "입력 처리(prefill) 병목이다. 서버 prefix caching이 꺼져 있거나 잘 안 맞거나, 서버의 "
-        "동시 처리 슬롯이 부족하거나, 장비에 비해 모델이 크다.",
-        "서버 prefix caching을 켜고(vLLM `--enable-prefix-caching`, llama.cpp는 기본 켜짐) "
-        "cache hit를 확인한다. 슬롯·배치 한도를 늘리거나, 더 작은·양자화 모델이나 더 빠른 "
-        "장비를 쓴다.",
-        "같은 시나리오로 다시 재서 근거의 단계가 SLO PASS(TTFT·ITL·에러율 모두)이고, "
-        "헤드라인 $/1M out이 이 문서 값보다 나빠지지 않으면 완료. 지표 하나만 좋아지고 "
-        "다른 지표가 나빠지면 완료가 아니다.",
+        "First token is slow (TTFT p95 over the limit)",
+        "Prefill bottleneck: server prefix caching is off or misses, the server has too few "
+        "concurrent slots, or the model is large for the hardware.",
+        "Turn on server prefix caching (vLLM `--enable-prefix-caching`; on by default in "
+        "llama.cpp) and check the cache hit rate; if it is N/A, first make the server report "
+        "cached tokens (see that task). Raise the slot or batch limits, or use a smaller "
+        "or quantized model, or faster hardware.",
+        "Re-measure with the same scenario. Done when the stage in the evidence passes the whole "
+        "SLO (TTFT, ITL and error rate) and the headline $/1M out is no worse than in this "
+        "document. Improving one metric while another gets worse is not done.",
     ),
     "itl_p95": Rule(
-        "생성이 느리다 (ITL p95 초과)",
-        "출력 생성(decode) 병목이다. 동시에 생성하는 요청이 너무 많거나, 입력 처리가 생성 "
-        "단계에 끼어들거나, 모델에 비해 장비 대역폭이 부족하다.",
-        "서버의 최대 동시 배치를 낮추거나, prefix caching으로 입력 처리를 줄이거나, 더 작은·"
-        "양자화 모델이나 더 빠른 장비를 쓴다.",
-        "같은 시나리오로 다시 재서 근거의 단계가 SLO PASS(TTFT·ITL·에러율 모두)이고, "
-        "헤드라인 $/1M out이 이 문서 값보다 나빠지지 않으면 완료. 지표 하나만 좋아지고 "
-        "다른 지표가 나빠지면 완료가 아니다.",
+        "Generation is slow (ITL p95 over the limit)",
+        "Decode bottleneck: too many requests generate at once, prefill work interrupts decoding, "
+        "or the hardware's memory bandwidth is short for the model.",
+        "Lower the server's maximum concurrent batch, cut prefill work with prefix caching, or use "
+        "a smaller or quantized model, or faster hardware.",
+        "Re-measure with the same scenario. Done when the stage in the evidence passes the whole "
+        "SLO (TTFT, ITL and error rate) and the headline $/1M out is no worse than in this "
+        "document. Improving one metric while another gets worse is not done.",
     ),
     "error_rate": Rule(
-        "에러율 초과",
-        "코드로 원인을 가른다. 429는 요청 한도, 5xx는 서버 오류·과부하, null은 타임아웃이나 "
-        "연결 끊김이다.",
-        "서버 로그에서 같은 시간대의 오류를 찾는다. 한도나 타임아웃이면 서버·게이트웨이 "
-        "설정을, 과부하면 동시 처리 한도를 조정한다.",
-        "같은 시나리오로 다시 재서 근거의 단계가 SLO PASS(TTFT·ITL·에러율 모두)이고, "
-        "헤드라인 $/1M out이 이 문서 값보다 나빠지지 않으면 완료. 지표 하나만 좋아지고 "
-        "다른 지표가 나빠지면 완료가 아니다.",
+        "Error rate over the limit",
+        "The status codes tell the cause: 429 is a rate limit, 5xx is a server error or "
+        "overload, null is a timeout or a dropped connection.",
+        "Find the errors of the same time window in the server log. For limits or timeouts, fix "
+        "the server or gateway settings; for overload, adjust the concurrency limit.",
+        "Re-measure with the same scenario. Done when the stage in the evidence passes the whole "
+        "SLO (TTFT, ITL and error rate) and the headline $/1M out is no worse than in this "
+        "document. Improving one metric while another gets worse is not done.",
     ),
     "cache_unreported": Rule(
-        "서버가 cached 토큰을 보고하지 않는다",
-        "응답 usage에 `prompt_tokens_details.cached_tokens`가 없다. 캐시 효과를 잴 수 없다.",
-        "vLLM은 `--enable-prompt-tokens-details`로 띄운다. 다른 엔진·API는 이 필드를 "
-        "지원하는지 확인한다.",
-        "다시 재서 cache hit%가 N/A가 아니면 완료.",
+        "The server does not report cached tokens",
+        "Responses have no `prompt_tokens_details.cached_tokens` in their usage, so the cache "
+        "effect cannot be measured.",
+        "Start vLLM with `--enable-prompt-tokens-details`. For other engines or APIs, check "
+        "whether they support this field.",
+        "Re-measure. Done when cache hit% is no longer N/A.",
     ),
     "cache_low": Rule(
-        "prefix cache가 잘 안 맞는다",
-        "personaload 워크로드는 보통 캐시가 잘 맞는다(공유 페르소나, 쌓이는 히스토리). "
-        f"cache hit가 {LOW_CACHE_HIT:.0%} 아래면 서버 prefix caching이 꺼져 있거나, 캐시가 "
-        "밀려나고 있거나, 워크로드 자체의 재사용이 적다(session.turns가 짧고 personas.count가 "
-        "세션 수보다 많아 첫 턴 요청이 대부분).",
-        "먼저 scenario.resolved.yaml의 session.turns와 personas.count로 워크로드 탓인지 본다. "
-        "아니면 서버 prefix caching 설정을 확인하고, KV 캐시 메모리(vLLM "
-        "`--gpu-memory-utilization`, llama.cpp `--ctx-size`)를 늘린다.",
-        f"다시 재서 cache hit가 {LOW_CACHE_HIT:.0%} 이상이면 완료.",
+        "The prefix cache rarely hits",
+        "personaload workloads usually cache well (shared personas, growing history). "
+        f"A cache hit rate below {LOW_CACHE_HIT:.0%} means server prefix caching is off, the cache "
+        "is evicting, or the workload itself has little reuse (short session.turns and more "
+        "personas than sessions, so most requests are first turns).",
+        "First check session.turns and personas.count in scenario.resolved.yaml to rule out the "
+        "workload. Otherwise check the server's prefix caching settings and give the KV cache more "
+        "memory (vLLM `--gpu-memory-utilization`, llama.cpp `--ctx-size`).",
+        f"Re-measure. Done when the cache hit rate is at least {LOW_CACHE_HIT:.0%}.",
     ),
     "usage": Rule(
-        "서버가 usage를 주지 않는다",
-        "스트리밍 응답에 usage가 없어, 출력 토큰을 청크 수로 대신 셌다. 처리량과 비용이 "
-        "부정확하다.",
-        "서버가 `stream_options.include_usage`를 지원하는지, 버전과 설정을 확인한다.",
-        "다시 재서 usage 없음 경고가 사라지면 완료.",
+        "The server does not return usage",
+        "Streaming responses carry no usage, so output tokens were counted from chunks. "
+        "Throughput and cost are inaccurate.",
+        "Check whether the server supports `stream_options.include_usage`, and its version and "
+        "settings.",
+        "Re-measure. Done when the missing-usage warning is gone.",
     ),
 }
 
@@ -142,37 +150,37 @@ def _stage_evidence(label: str, s: dict, slo: dict) -> list[tuple[str, str]]:
     at = f"{label} stage {s['stage']:02d}: "
     if s.get("status") == "failed":
         first = (s.get("error") or "").splitlines()[:1]
-        return [("failed", at + (first[0] if first else "원인 미상"))]
+        return [("failed", at + (first[0] if first else "unknown cause"))]
     found = []
     judged = s.get("slo") or {}
     verdict, violations = judged.get("verdict", NA), judged.get("violations") or []
     requests = s.get("requests") or {}
     if s.get("status") != "ok" or verdict not in (PASS, FAIL):
         n = requests.get("success", 0) + requests.get("error", 0)
-        line = f"status {s.get('status', NA)}, SLO {verdict}, 측정 구간 요청 {n}건"
-        found.append(("unjudged", at + line + f" (기록 {s.get('records', NA)}건)"))
+        line = f"status {s.get('status', NA)}, SLO {verdict}, {n} requests in the window"
+        found.append(("unjudged", at + line + f" ({s.get('records', NA)} records)"))
     ok = requests.get("success")
-    sample = f", 성공 요청 {ok}건" if ok is not None else ""
+    sample = f", {ok} successful requests" if ok is not None else ""
     if "ttft_p95" in violations:
         ttft = _num((s.get("ttft_ms") or {}).get("p95"), ".0f")
-        limit = f"기준 {slo.get('ttft_p95', NA)}{sample}"
+        limit = f"limit {slo.get('ttft_p95', NA)}{sample}"
         found.append(("ttft_p95", at + f"TTFT p95 {ttft} ms ({limit})"))
     if "itl_p95" in violations:
         itl = _num((s.get("itl_ms") or {}).get("p95"), ".1f")
-        limit = f"기준 {slo.get('itl_p95', NA)}{sample}"
+        limit = f"limit {slo.get('itl_p95', NA)}{sample}"
         found.append(("itl_p95", at + f"ITL p95 {itl} ms ({limit})"))
     if "error_rate" in violations:
         codes = ", ".join(f"{code}×{n}" for code, n in (s.get("error_codes") or {}).items())
-        line = f"에러율 {_pct(s.get('error_rate'))} (기준 {_pct(slo.get('error_rate_max'))})"
-        found.append(("error_rate", at + line + (f", 코드 {codes}" if codes else "")))
+        line = f"error rate {_pct(s.get('error_rate'))} (limit {_pct(slo.get('error_rate_max'))})"
+        found.append(("error_rate", at + line + (f", codes {codes}" if codes else "")))
     cache = s.get("cache_hit") or {}
     if cache.get("eligible") and not cache.get("reported"):
-        found.append(("cache_unreported", at + f"cached 보고 0/{cache['eligible']}건"))
+        found.append(("cache_unreported", at + f"cached reported 0/{cache['eligible']}"))
     elif cache.get("rate") is not None and cache["rate"] < LOW_CACHE_HIT:
-        counts = f"cached 보고 {cache['reported']}/{cache['eligible']}건"
+        counts = f"cached reported {cache['reported']}/{cache['eligible']}"
         found.append(("cache_low", at + f"cache hit {_pct(cache['rate'])} ({counts})"))
     if n := s.get("usage_missing"):
-        found.append(("usage", at + f"usage 없는 요청 {n}건"))
+        found.append(("usage", at + f"{n} requests without usage"))
     return found
 
 
@@ -180,14 +188,14 @@ def _target_line(label: str, sc: dict) -> str:
     target, slo, cost = sc.get("target") or {}, sc.get("slo") or {}, sc.get("cost") or {}
     model = f"`{target['model']}`" if target.get("model") else NA
     url = f"`{target['base_url']}`" if target.get("base_url") else NA
-    line = f"- {label}: 모델 {model} @ {url}"
+    line = f"- {label}: model {model} @ {url}"
     if slo:
         line += (
             f", SLO TTFT p95 ≤ {slo.get('ttft_p95', NA)}, ITL p95 ≤ {slo.get('itl_p95', NA)}, "
-            f"에러율 ≤ {_pct(slo.get('error_rate_max'))}"
+            f"error rate ≤ {_pct(slo.get('error_rate_max'))}"
         )
     if cost:
-        line += f", 원가 기준 시간당 ${cost.get('gpu_hourly_usd', NA)} × {cost.get('gpu_count', 1)}"
+        line += f", cost basis ${cost.get('gpu_hourly_usd', NA)}/h × {cost.get('gpu_count', 1)}"
         line += f" ({cost['label']})" if cost.get("label") else ""
     return line
 
@@ -198,10 +206,14 @@ def _tasks(evidence: dict[str, list[str]]) -> str:
         if not evidence.get(key):
             continue
         lines = [f"### {len(blocks) + 1}. {rule.title}"]
-        lines += [f"- 근거: {e}" for e in evidence[key]]
-        lines += [f"- 원인 후보: {rule.causes}", f"- 할 일: {rule.todo}", f"- 확인: {rule.check}"]
+        lines += [f"- Evidence: {e}" for e in evidence[key]]
+        lines += [
+            f"- Likely causes: {rule.causes}",
+            f"- To do: {rule.todo}",
+            f"- Done when: {rule.check}",
+        ]
         blocks.append("\n".join(lines))
-    return "\n\n".join(blocks) or "없음: 모든 단계가 SLO를 통과했고 고칠 문제가 보이지 않는다."
+    return "\n\n".join(blocks) or "None: every stage passed the SLO and nothing needs fixing."
 
 
 def _comparison(runs: dict[str, tuple[Path, list[dict]]]) -> list[str]:
@@ -215,17 +227,15 @@ def _comparison(runs: dict[str, tuple[Path, list[dict]]]) -> list[str]:
         if base == 0 and tps and base_tps:  # local runs priced at $0: compare throughput instead
             delta = (tps / base_tps - 1) * 100
             lines.append(
-                f"- {label}: 헤드라인 out tok/s {tps:.1f}, {base_label} 대비 {delta:+.0f}% "
-                "(원가 $0이라 처리량으로 비교)"
+                f"- {label}: headline out tok/s {tps:.1f}, {delta:+.0f}% vs {base_label} "
+                "(compared on throughput because the cost is $0)"
             )
         elif base and usd is not None:
             delta = (usd / base - 1) * 100
-            lines.append(
-                f"- {label}: 헤드라인 $/1M out ${usd:.3f}, {base_label} 대비 {delta:+.0f}%"
-            )
+            lines.append(f"- {label}: headline $/1M out ${usd:.3f}, {delta:+.0f}% vs {base_label}")
         else:
             lines.append(
-                f"- {label}: {base_label} 대비 비교 불가 (SLO 통과 단계가 없거나 원가 N/A)"
+                f"- {label}: cannot compare with {base_label} (no SLO-passing stage, or cost N/A)"
             )
     return lines
 
@@ -239,15 +249,16 @@ def _quality(label: str, stages: list[dict]) -> list[str]:
         n = (s.get("requests") or {}).get("success") or 0
         if 0 < n < MIN_REQUESTS_FOR_P95:
             lines.append(
-                at + f"측정 구간의 성공 요청이 {n}건뿐이라 p95가 상위 1~2건으로 정해진다. "
-                "판정(PASS 포함)이 우연에 좌우될 수 있으니 duration을 늘려 다시 재서 판단한다."
+                at + f"only {n} successful requests in the window, "
+                "so p95 is set by the top one or two. "
+                "The verdict (PASS included) may be luck: lengthen duration and re-measure."
             )
     top = max(stages, key=lambda s: s["stage"], default=None)
     if top and top.get("status") == "ok" and (top.get("slo") or {}).get("verdict") == PASS:
         lines.append(
-            f"- {label} stage {top['stage']:02d}: 최고 부하 단계까지 PASS라 포화점에 닿지 "
-            "않았다. 헤드라인은 스윕 상한에서 잘린 값이라 실제 $/1M out은 더 낮을 수 있고, "
-            "이 값과의 비교도 그만큼 덜 정확하다. 더 높은 부하 단계를 추가해 다시 잰다."
+            f"- {label} stage {top['stage']:02d}: even the highest load passed, so saturation "
+            "was not reached. The headline is capped by the sweep, the real $/1M out may be lower, "
+            "and comparisons with it are less exact. Add higher load stages and re-measure."
         )
     return lines
 
@@ -256,16 +267,17 @@ def _rerun(current_dir: Path, has_scenario: bool) -> str:
     """Absolute, quoted commands that work from any directory and any shell PATH."""
     exe = f"{shlex.quote(sys.executable)} -m personaload"
     scenario = shlex.quote(str(current_dir / "scenario.resolved.yaml"))
-    run = f"{exe} run {scenario} --out results/after"
+    after = current_dir.parent / "after"  # next to the measured run
+    out = shlex.quote(str(after))
+    run = f"{exe} run {scenario} --out {out}"
     if not has_scenario:
         run = (
-            "# scenario.resolved.yaml이 없다: 원래 시나리오 YAML로 실행한다\n"
-            f"{exe} run <원래 시나리오.yaml> --out results/after"
+            "# no scenario.resolved.yaml: run the original scenario YAML\n"
+            f"{exe} run <original-scenario.yaml> --out {out}"
         )
-    return (
-        f"{run}\n{exe} report {shlex.quote(str(current_dir))} results/after/<새 결과 디렉터리> "
-        "--handoff handoff.md"
-    )
+    new_run = shlex.quote(str(after)) + "/<new-results-dir>"
+    handoff = shlex.quote(str(current_dir.parent / "handoff.md"))
+    return f"{run}\n{exe} report {shlex.quote(str(current_dir))} {new_run} --handoff {handoff}"
 
 
 def handoff_markdown(run_dirs: Sequence[Path]) -> str:
@@ -285,37 +297,37 @@ def handoff_markdown(run_dirs: Sequence[Path]) -> str:
     mismatch = workload_warnings({label: st for label, (_, st) in runs.items()})
     rerun = _rerun(current_dir, bool(scenarios[current]))
     sweep = (
-        "\n\n부하를 단계별로 올리는 스윕이라, 헤드라인 단계보다 높은 단계의 FAIL은 서버의 "
-        "포화점일 수 있다. 목표 동시 접속 수(또는 도착률)가 정해져 있지 않으면 사용자에게 "
-        "먼저 묻는다."
+        "\n\nThis is a sweep that raises the load stage by stage, so a FAIL above the headline "
+        "stage may just be the server's saturation point. If the target concurrency (or arrival "
+        "rate) is not known, ask the user first."
         if evidence and len(current_stages) > 1
         else ""
     )
     raw = [f"- {label}: `{path}`" for label, (path, _) in runs.items()]
     raw.append(
-        "\n각 디렉터리: `report.md`(단계 표), `stage_NN/stage.json`(단계 집계), "
-        "`stage_NN/aiperf/profile_export.jsonl`(요청별 레코드, `record_requests: false`면 없음), "
-        "`stage_NN/aiperf/logs/aiperf.log`(AIPerf 로그)."
+        "\nEach directory: `report.md` (stage table), `stage_NN/stage.json` (stage summary), "
+        "`stage_NN/aiperf/profile_export.jsonl` (per-request records; absent with "
+        "`record_requests: false`), `stage_NN/aiperf/logs/aiperf.log` (AIPerf log)."
     )
     parts = [
-        f"# personaload 결과 인계: {', '.join(labels)}",
+        f"# personaload handoff: {', '.join(labels)}",
         INTRO,
-        "## 측정 대상",
+        "## Target",
         "\n".join(_target_line(label, scenarios[label]) for label in labels),
-        "## 결과",
-        *[f"> 경고: {w}. 이 비교는 공정하지 않다." for w in mismatch],
+        "## Results",
+        *[f"> Warning: {w}. This comparison is not fair." for w in mismatch],
         "\n".join(results),
         stage_table([(label if many else None, s) for label, (_, st) in runs.items() for s in st]),
-        "## 할 일",
-        f"마지막 결과({current}) 기준이다.{sweep}",
+        "## Tasks",
+        f"Based on the last result ({current}).{sweep}",
         _tasks(evidence),
-        "## 측정 품질 경고 (서비스 코드 수정 대상 아님)",
-        "\n".join(quality) or "없음",
-        "## 다시 재는 법",
-        "설정을 고친 뒤 같은 시나리오로 다시 잰다. 시나리오가 같으면 데이터셋(sha256)이 같아 "
-        "전후 비교가 공정하다.",
+        "## Measurement quality warnings (not service-code fixes)",
+        "\n".join(quality) or "none",
+        "## How to re-measure",
+        "After changing the settings, re-measure with the same scenario. The same scenario gives "
+        "the same dataset (sha256), so the before/after comparison is fair.",
         f"```bash\n{rerun}\n```",
-        "## 원자료",
+        "## Raw data",
         "\n".join(raw),
     ]
     return "\n\n".join(parts) + "\n"

@@ -7,3 +7,11 @@ __pycache__/
 results/
 _workspace/
 _workspace_prev/
+dist/
+build/
+.DS_Store
+runs/
+handoff.md
+# local development harness (not part of the published project)
+CLAUDE.md
+.claude/

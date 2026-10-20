@@ -7,13 +7,23 @@ import json
 import os
 import shutil
 import signal
+import socket
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from personaload.config import ArrivalStage, OutputConfig, Scenario, Stage, dump_scenario
+from personaload.config import (
+    ArrivalStage,
+    OutputConfig,
+    Scenario,
+    Stage,
+    TargetConfig,
+    dump_scenario,
+)
 from personaload.report.aggregate import (
     active_sessions,
     arrival_diagnostics,
@@ -47,7 +57,7 @@ def stage_dir(root: Path, stage_no: int) -> Path:
 
 
 def resolved_header(scenario: Scenario) -> str:
-    header = "# personaload 시나리오 (기본값 적용 결과)\n"
+    header = "# personaload scenario (defaults applied)\n"
     if scenario.personas.source == "file":
         header += f"# personas.file sha256: {file_sha256(scenario.personas.file)}\n"
     return header
@@ -59,7 +69,25 @@ def check_aiperf_version() -> None:
     except PackageNotFoundError:
         found = None
     if found != AIPERF_VERSION:
-        raise RuntimeError(f"aiperf=={AIPERF_VERSION}이 필요하다 (설치된 버전: {found})")
+        raise RuntimeError(f"aiperf=={AIPERF_VERSION} is required (installed: {found})")
+
+
+def check_target(target: TargetConfig, timeout_s: float = 5.0) -> None:
+    """A dead target otherwise surfaces as a failed stage under a wall of AIPerf connection
+    errors. Only opens a TCP connection: no request, no auth, any HTTP server passes.
+    An unset key would not fail fast either: every request just comes back 401."""
+    if target.api_key_env and not os.environ.get(target.api_key_env):
+        raise RuntimeError(
+            f"target.api_key_env names {target.api_key_env}, but that environment variable is empty"
+        )
+    url = urlsplit(target.base_url)
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        socket.create_connection((url.hostname, port), timeout=timeout_s).close()
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot reach target.base_url {target.base_url} ({exc}). Is the server running?"
+        ) from exc
 
 
 async def _probe_listen(host: str, port: int) -> None:
@@ -78,8 +106,8 @@ def check_prometheus_port(output: OutputConfig) -> None:
     except OSError as exc:
         where = f"{output.prometheus_host}:{output.prometheus_port}"
         raise RuntimeError(
-            f"output.prometheus_port {where}을 열 수 없다: {exc} "
-            "(Prometheus 서버 등 다른 프로세스가 쓰는지 확인)"
+            f"cannot open output.prometheus_port {where}: {exc} "
+            "(check whether another process, such as a Prometheus server, uses it)"
         ) from exc
 
 
@@ -124,9 +152,9 @@ def _failure(outcome: Outcome, records: Path) -> str | None:
     if outcome.interrupted:
         return None
     if outcome.exit_code != 0:
-        return f"aiperf 종료 코드 {outcome.exit_code}"
+        return f"aiperf exit code {outcome.exit_code}"
     if not records.exists():
-        return "profile_export.jsonl이 없다"
+        return "no profile_export.jsonl"
     return None
 
 
@@ -267,8 +295,21 @@ def _new_run_dir(base: Path, name: str) -> Path:
     return path
 
 
+def _stage_label(stage: Stage) -> str:
+    load = (
+        f"{stage.sessions_per_sec:g} sessions/s"
+        if isinstance(stage, ArrivalStage)
+        else f"concurrency {stage.concurrency}"
+    )
+    return f"{load}, {(stage.warmup + stage.duration) / 1000:g}s + drain"
+
+
 def run_scenario(
-    scenario: Scenario, personas: list[Persona], base_dir: Path, cpu_count: int | None = None
+    scenario: Scenario,
+    personas: list[Persona],
+    base_dir: Path,
+    cpu_count: int | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> RunResult:
     """Run every stage in order. Stops at the first failed stage, or on Ctrl+C, SIGTERM or
     SIGHUP (each forwarded to AIPerf as one SIGINT)."""
@@ -288,6 +329,10 @@ def run_scenario(
         for stage_no in range(1, len(scenario.load.stages) + 1):
             if interrupts.count:
                 break
+            if progress:
+                stage = scenario.load.stages[stage_no - 1]
+                total = len(scenario.load.stages)
+                progress(f"stage {stage_no:02d}/{total:02d} running ({_stage_label(stage)})")
             result = run_stage(
                 scenario, personas, stage_no, run_dir, interrupts, cpu_count or os.cpu_count() or 1
             )

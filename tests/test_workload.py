@@ -87,8 +87,8 @@ def test_file_personas(tmp_path):
     ("content", "message"),
     [
         ("{bad json\n", "JSON"),
-        ("[1, 2]\n", "객체"),
-        ('{"name": "x", "system_prompt": ""}\n', "비어"),
+        ("[1, 2]\n", "object"),
+        ('{"name": "x", "system_prompt": ""}\n', "non-empty"),
     ],
 )
 def test_file_personas_errors(tmp_path, content, message):
@@ -99,7 +99,7 @@ def test_file_personas_errors(tmp_path, content, message):
 
 
 def test_file_personas_missing_file(tmp_path):
-    with pytest.raises(PersonaError, match="읽을 수 없다"):
+    with pytest.raises(PersonaError, match="cannot read"):
         file_personas(tmp_path / "none.jsonl", None)
 
 
@@ -254,14 +254,14 @@ def test_file_personas_keep_unicode_line_separators(tmp_path):
 def test_file_personas_reject_lone_surrogates(tmp_path):
     path = tmp_path / "p.jsonl"
     path.write_text('{"name": "S", "system_prompt": "bad \\ud800 x"}\n', encoding="utf-8")
-    with pytest.raises(PersonaError, match="서로게이트"):
+    with pytest.raises(PersonaError, match="surrogates"):
         file_personas(path, None)
 
 
 def test_file_personas_reject_non_utf8(tmp_path):
     path = tmp_path / "p.jsonl"
     path.write_bytes(b'{"name": "A", "system_prompt": "\xff\xfe"}\n')
-    with pytest.raises(PersonaError, match="읽을 수 없다"):
+    with pytest.raises(PersonaError, match="cannot read"):
         file_personas(path, None)
 
 

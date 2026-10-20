@@ -96,9 +96,12 @@ def run_watched(
             if interrupts.count >= 1:
                 stop(None)
             elif run_deadline is None and now - started > startup_timeout_s:
-                stop(f"기동 워치독: {startup_timeout_s:g}s 안에 PROFILING에 진입하지 못했다")
+                stop(
+                    "startup watchdog: AIPerf did not reach PROFILING "
+                    f"within {startup_timeout_s:g}s"
+                )
             elif run_deadline is not None and now > run_deadline:
-                stop(f"실행 워치독: PROFILING 이후 {run_budget_s:g}s를 넘겼다")
+                stop(f"run watchdog: more than {run_budget_s:g}s since PROFILING started")
         if kill_at is not None and now > kill_at and not sent_sigkill:
             _signal_group(proc.pid, signal.SIGKILL)
             sent_sigkill = True

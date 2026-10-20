@@ -20,14 +20,16 @@ class ReportError(Exception):
 def load_run(run_dir: Path) -> list[dict]:
     paths = sorted(Path(run_dir).glob("stage_*/stage.json"))
     if not paths:
-        raise ReportError(f"{run_dir}: stage_*/stage.json이 없다")
+        runs = sorted(p.parent.parent.name for p in Path(run_dir).glob("*/stage_*/stage.json"))
+        hint = f" (pass a run directory, e.g. {Path(run_dir) / runs[-1]})" if runs else ""
+        raise ReportError(f"{run_dir}: no stage_*/stage.json{hint}")
     try:
         stages = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReportError(f"{run_dir}: stage.json을 읽지 못했다: {exc}") from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReportError(f"{run_dir}: cannot read stage.json: {exc}") from exc
     for path, stage in zip(paths, stages, strict=True):
         if not isinstance(stage, dict) or not isinstance(stage.get("stage"), int):
-            raise ReportError(f"{path}: stage.json 형식이 아니다")
+            raise ReportError(f"{path}: not a stage.json")
     return stages
 
 
@@ -37,7 +39,11 @@ def workload_warnings(runs: dict[str, list[dict]]) -> list[str]:
     for stages in runs.values():
         for s in stages:
             digests.setdefault(s["stage"], set()).add(s.get("dataset_sha256"))
-    return [f"단계 {k}의 워크로드가 다름" for k, found in sorted(digests.items()) if len(found) > 1]
+    return [
+        f"stage {k} ran a different workload"
+        for k, found in sorted(digests.items())
+        if len(found) > 1
+    ]
 
 
 def load_runs(run_dirs: Sequence[Path]) -> dict[str, tuple[Path, list[dict]]]:
@@ -51,9 +57,9 @@ def load_runs(run_dirs: Sequence[Path]) -> dict[str, tuple[Path, list[dict]]]:
 
 def compare_markdown(run_dirs: Sequence[Path]) -> str:
     runs = {name: stages for name, (_, stages) in load_runs(run_dirs).items()}
-    parts = ["# personaload 비교"]
-    parts += [f"> 경고: {w}" for w in workload_warnings(runs)]
-    parts.append("## 헤드라인")
+    parts = ["# personaload comparison"]
+    parts += [f"> Warning: {w}" for w in workload_warnings(runs)]
+    parts.append("## Headlines")
     parts.append("\n".join(f"- {name}: {headline_text(headline(st))}" for name, st in runs.items()))
     parts.append(stage_table([(name, s) for name, stages in runs.items() for s in stages]))
     return "\n\n".join(parts) + "\n"

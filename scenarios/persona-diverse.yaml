@@ -1,5 +1,5 @@
-# 페르소나 500개를 고르게 쓰는 캐릭터챗. persona-shared와 비교하면 prefix cache가 덜 듣는 경우를 본다.
-# 대상: GPU 서버의 vLLM(scripts/vllm-linux.sh). 단계당 3분 30초, 전체 약 12분.
+# Character chat over 500 personas used evenly. Compare with persona-shared to see weaker prefix-cache reuse.
+# Target: vLLM on a GPU server (scripts/vllm-linux.sh). 3m30s per stage, ~12 min total.
 name: persona-diverse
 seed: 42
 
@@ -7,7 +7,7 @@ target:
   base_url: http://127.0.0.1:8000/v1
   model: local-model
   timeout: 120s
-  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: thinking 끄기
+  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: turn thinking off
 
 personas:
   count: 500
@@ -38,4 +38,4 @@ cost:
   label: RunPod L40S
 
 output:
-  prometheus_port: 9090               # 실행 중 http://127.0.0.1:9090/metrics
+  prometheus_port: 9090               # live at http://127.0.0.1:9090/metrics during the run

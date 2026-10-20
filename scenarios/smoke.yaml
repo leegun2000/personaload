@@ -1,4 +1,4 @@
-# 약 1분짜리 동작 확인. 맥북 llama.cpp(scripts/llama-cpp-macos.sh)나 `personaload mockserver`를 대상으로 한다.
+# A ~1 minute check against llama.cpp on a Mac (scripts/llama-cpp-macos.sh) or `personaload mockserver`.
 name: smoke
 seed: 1
 
@@ -6,7 +6,7 @@ target:
   base_url: http://127.0.0.1:8000/v1
   model: local-model
   timeout: 60s
-  max_tokens_field: max_tokens        # llama.cpp·vLLM·mock 모두 받는 필드
+  max_tokens_field: max_tokens        # accepted by llama.cpp, vLLM and the mock
 
 personas:
   count: 3
@@ -30,5 +30,5 @@ slo:
   error_rate_max: 0.01
 
 cost:
-  gpu_hourly_usd: 0                   # 로컬 장비: 원가는 $0으로 나온다
+  gpu_hourly_usd: 0                   # local machine: costs come out as $0
   label: local

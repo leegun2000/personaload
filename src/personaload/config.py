@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     JsonValue,
     PlainSerializer,
+    StrictFloat,
     StrictInt,
     ValidationError,
     model_validator,
@@ -42,10 +43,10 @@ class ScenarioError(Exception):
 
 def parse_duration_ms(value: Any) -> float:
     if not isinstance(value, str):
-        raise ValueError("기간은 '100ms', '30s', '3m', '1h' 형식의 문자열이어야 한다")
+        raise ValueError("a duration must be a string like '100ms', '30s', '3m' or '1h'")
     match = _DURATION_RE.match(value)
     if not match:
-        raise ValueError(f"기간 형식이 아니다: {value!r} (예: '100ms', '30s', '3m', '1h')")
+        raise ValueError(f"not a duration: {value!r} (examples: '100ms', '30s', '3m', '1h')")
     # Decimal keeps '2.01s' at exactly 2010.0; float('2.01') * 1000 would be 2009.999...
     return float(Decimal(match.group(1)) * _UNIT_MS[match.group(2)])
 
@@ -98,20 +99,22 @@ class Dist(BaseModel):
     def _check(self) -> Dist:
         missing = [f for f in _REQUIRED[self.dist] if getattr(self, f) is None]
         if missing:
-            raise ValueError(f"dist={self.dist}에는 {', '.join(missing)}가 필요하다")
+            raise ValueError(f"dist={self.dist} needs {', '.join(missing)}")
         unused = [
             f for f in _PARAMS if getattr(self, f) is not None and f not in _ALLOWED[self.dist]
         ]
         if unused:
-            raise ValueError(f"dist={self.dist}에서는 {', '.join(unused)}를 쓰지 않는다")
+            raise ValueError(f"dist={self.dist} does not use {', '.join(unused)}")
         if any(getattr(self, f) is not None and getattr(self, f) < 0 for f in _PARAMS):
-            raise ValueError("분포 값은 0 이상이어야 한다")
+            raise ValueError("distribution values must be >= 0")
         if self.min is not None and self.max is not None and self.min > self.max:
-            raise ValueError("min ≤ max여야 한다")
+            raise ValueError("min must be <= max")
         if self.dist in ("lognormal", "exponential") and self.mean <= 0:
-            raise ValueError("mean > 0이어야 한다")
+            raise ValueError("mean must be > 0")
+        if self.dist == "lognormal" and self.stddev > 1e6 * self.mean:  # sampling would overflow
+            raise ValueError("lognormal stddev/mean is too large (max 1e6)")
         if self.dist == "constant" and not self._within(self.value):
-            raise ValueError("constant의 value는 [min, max] 안이어야 한다")
+            raise ValueError("a constant value must lie within [min, max]")
         return self
 
     def _within(self, x: float) -> bool:
@@ -127,11 +130,11 @@ class Dist(BaseModel):
 class CountDist(Dist):
     """Integer quantity (turns, tokens). uniform draws integers in [min, max]."""
 
-    min: float | None = None
-    max: float | None = None
-    mean: float | None = None
-    stddev: float | None = None
-    value: float | None = None
+    min: StrictFloat | None = None
+    max: StrictFloat | None = None
+    mean: StrictFloat | None = None
+    stddev: StrictFloat | None = None
+    value: StrictFloat | None = None
 
     @model_validator(mode="after")
     def _integer_bounds(self) -> CountDist:
@@ -143,7 +146,7 @@ class CountDist(Dist):
         for name in fixed:
             v = getattr(self, name)
             if v is not None and not float(v).is_integer():
-                raise ValueError(f"{name}는 정수여야 한다")
+                raise ValueError(f"{name} must be an integer")
         return self
 
 
@@ -157,7 +160,7 @@ class DurationDist(Dist):
 
 def _require_min_one(dist: CountDist, field: str) -> None:
     if dist.lower_bound() < 1:
-        raise ValueError(f"{field}의 최솟값은 1 이상이어야 한다 (min을 1 이상으로 지정)")
+        raise ValueError(f"{field} must be at least 1 (set min >= 1)")
 
 
 # --- sections -----------------------------------------------------------------------------
@@ -177,11 +180,11 @@ class TargetConfig(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> TargetConfig:
         if self.timeout <= 0:
-            raise ValueError("timeout > 0이어야 한다")
+            raise ValueError("timeout must be > 0")
         try:
             json.dumps(self.extra_body, allow_nan=False)
         except ValueError as exc:
-            msg = "extra_body는 JSON으로 직렬화 가능해야 한다 (NaN/Infinity 불가)"
+            msg = "extra_body must be JSON-serializable (no NaN/Infinity)"
             raise ValueError(msg) from exc
         return self
 
@@ -198,10 +201,10 @@ class PersonasConfig(BaseModel):
     def _check(self) -> PersonasConfig:
         if self.source == "synthetic":
             if self.count is None or self.system_prompt_tokens is None:
-                raise ValueError("source=synthetic에는 count와 system_prompt_tokens가 필요하다")
+                raise ValueError("source=synthetic needs count and system_prompt_tokens")
             _require_min_one(self.system_prompt_tokens, "system_prompt_tokens")
         elif self.file is None:
-            raise ValueError("source=file에는 file이 필요하다")
+            raise ValueError("source=file needs file")
         return self
 
 
@@ -215,7 +218,7 @@ class SessionConfig(BaseModel):
     think_time: DurationDist
     retrieved_tokens: CountDist | None = None  # RAG: a new document in front of every user turn
     persona_selection: Literal["uniform", "zipf"] = "uniform"
-    zipf_s: float = 1.0
+    zipf_s: StrictFloat = 1.0
 
     @model_validator(mode="after")
     def _check(self) -> SessionConfig:
@@ -224,9 +227,9 @@ class SessionConfig(BaseModel):
         if self.retrieved_tokens is not None:
             _require_min_one(self.retrieved_tokens, "retrieved_tokens")
         if self.think_time.max is None and self.think_time.dist != "constant":
-            raise ValueError("think_time에는 max가 필요하다")
+            raise ValueError("think_time needs max")
         if self.persona_selection == "zipf" and self.zipf_s <= 0:
-            raise ValueError("persona_selection=zipf이면 zipf_s > 0이어야 한다")
+            raise ValueError("persona_selection=zipf needs zipf_s > 0")
         return self
 
 
@@ -239,7 +242,7 @@ class _StageBase(BaseModel):
     @model_validator(mode="after")
     def _check_duration(self) -> _StageBase:
         if self.duration <= 0:
-            raise ValueError("duration > 0이어야 한다")
+            raise ValueError("duration must be > 0")
         return self
 
 
@@ -251,7 +254,7 @@ class ConcurrencyStage(_StageBase):
 
 class ArrivalStage(_StageBase):
     kind: Literal["arrival_rate"] = Field(default="arrival_rate", exclude=True)
-    sessions_per_sec: float = Field(gt=0)
+    sessions_per_sec: StrictFloat = Field(gt=0)
     max_concurrency: StrictInt = Field(ge=1)
 
 
@@ -263,7 +266,7 @@ class LoadConfig(BaseModel):
 
     mode: Literal["concurrency", "arrival_rate"]
     drain_timeout: Ms
-    session_pool_factor: float = Field(default=3.0, ge=1)
+    session_pool_factor: StrictFloat = Field(default=3.0, ge=1)
     stages: list[Stage] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -283,19 +286,19 @@ class SloConfig(BaseModel):
 
     ttft_p95: Ms
     itl_p95: Ms
-    error_rate_max: float = Field(ge=0, le=1)
+    error_rate_max: StrictFloat = Field(ge=0, le=1)
 
     @model_validator(mode="after")
     def _check(self) -> SloConfig:
         if self.ttft_p95 <= 0 or self.itl_p95 <= 0:
-            raise ValueError("ttft_p95와 itl_p95는 0보다 커야 한다")
+            raise ValueError("ttft_p95 and itl_p95 must be > 0")
         return self
 
 
 class CostConfig(BaseModel):
     model_config = _STRICT
 
-    gpu_hourly_usd: float = Field(ge=0)
+    gpu_hourly_usd: StrictFloat = Field(ge=0)
     gpu_count: StrictInt = Field(default=1, ge=1)
     label: str = ""
 
@@ -366,12 +369,12 @@ def scenario_from_dict(data: Any) -> Scenario:
 def load_scenario(path: str | Path) -> Scenario:
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ScenarioError([f"시나리오 파일을 읽을 수 없다: {exc}"]) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ScenarioError([f"cannot read the scenario file: {exc}"]) from exc
     try:
         data = YAML(typ="safe").load(text)
     except (YAMLError, ValueError) as exc:  # ruamel raises ValueError for huge ints
-        raise ScenarioError([f"YAML 파싱 실패: {exc}"]) from exc
+        raise ScenarioError([f"YAML parse error: {exc}"]) from exc
     scenario = scenario_from_dict(data)
     if scenario.personas.file is None:
         return scenario

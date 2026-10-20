@@ -2,9 +2,11 @@
 
 [English](README.md) | **한국어**
 
-OpenAI 호환 서빙 엔진(vLLM, SGLang, llama.cpp server 등)에 **AI 캐릭터챗 트래픽 패턴**으로 부하를 걸고, 지연·처리량·**SLO를 지키는 최대 처리량 기준 `$ / 1M 출력 토큰`**을 내는 벤치마크다.
+OpenAI 호환 서빙 엔진(vLLM, SGLang, llama.cpp server 등)에 **캐릭터챗·RAG 상담 챗봇 형태의 트래픽**으로 부하를 걸고, 지연·처리량·prefix cache 적중률과 **SLO를 지키는 최대 처리량 기준 원가**(`$/1M 출력 토큰`, `$/1K turns`, `$/session`)를 내는 벤치마크다.
 
-- 캐릭터챗 특성은 워크로드 데이터셋으로 만든다: 멀티턴 히스토리 누적, 공유 페르소나 system 프롬프트와 Zipf 인기 쏠림, 턴마다 새로 뽑는 think time, 세션 단위 도착.
+- 챗봇 특성은 워크로드 데이터셋으로 만든다: 멀티턴 히스토리 누적, 공유 페르소나(지시문) system 프롬프트와 Zipf 인기 쏠림, 턴마다 새로 뽑는 think time, 세션 단위 도착, 턴마다 붙는 검색 문서(RAG, 선택).
+- 실측 예시: Apple M5 Pro + vLLM Metal, Qwen3 0.6B~4B(MLX 4비트), 32~96토큰의 짧은 답, 동시성 2/4/8/16, 조건마다 1회 측정. prefix caching을 **끄면** 같은 SLO에서 `$/1M out`이 페르소나 5개 공유일 때 1.9~3.8배, 페르소나 500개일 때 1.6~2.1배가 됐다(캐싱의 절감 효과로 보면 47~73%, 38~53%). vLLM은 prefix caching이 기본으로 켜져 있으니, 캐시가 꺼지거나 밀려날 때의 손해로 읽는다. 데이터센터 GPU에서는 차이가 더 작을 수 있다. 자세한 내용: [docs/cache-savings-m5.ko.md](docs/cache-savings-m5.ko.md).
+- CLI 출력, `report.md`, 인계 문서는 영어다. 실측 기록은 영어·한국어 둘 다 있고, 설계 문서(SPEC_B.md)와 선행 도구 조사(docs/prior-art.md)는 한국어다.
 - 부하 생성과 요청별 측정은 [AIPerf](https://github.com/ai-dynamo/aiperf) 0.12.0이 한다. personaload는 데이터셋 생성, 단계 실행, 리포트, 테스트용 mock 서버를 맡는다.
 - 설계 문서: [SPEC_B.md](SPEC_B.md). AIPerf 동작의 근거: [docs/aiperf-v0.12.0-facts.json](docs/aiperf-v0.12.0-facts.json).
 
@@ -13,11 +15,13 @@ OpenAI 호환 서빙 엔진(vLLM, SGLang, llama.cpp server 등)에 **AI 캐릭�
 Python 3.11~3.13이 필요하다(AIPerf 제약). macOS(arm64)와 Linux(amd64, arm64)에서 동작한다.
 
 ```bash
+git clone https://github.com/leegun2000/personaload && cd personaload
 python3.12 -m venv .venv            # 3.11~3.13 중 하나 (맥: brew install python@3.12)
 .venv/bin/pip install -e .          # 개발: pip install -e ".[dev]"
 source .venv/bin/activate
 ```
 
+- 전용 가상환경을 쓴다. AIPerf가 의존성을 엄격히 고정하고 많이 끌어와 환경이 약 0.9 GB다.
 - AIPerf 0.12.0이 함께 설치된다. 다른 버전이면 `personaload run`이 시작하지 않는다.
 - 토큰 수 계산용 tiktoken `o200k_base`를 첫 실행 때 한 번 내려받는다. 오프라인 환경이면 `TIKTOKEN_CACHE_DIR`에 미리 채워 둔다.
 - Linux arm64에서는 AIPerf 의존성 `crick`을 빌드하므로 C 컴파일러가 필요하다.
@@ -32,23 +36,25 @@ personaload mockserver                    # 127.0.0.1:8000, TTFT 200ms, 스트�
 
 ```bash
 personaload validate scenarios/smoke.yaml # 기본값 적용 결과, 단계별 세션 수·파일 크기 추정, AIPerf 명령
-personaload run scenarios/smoke.yaml      # 약 50초
+personaload run scenarios/smoke.yaml      # 약 1분 (첫 실행은 토크나이저 파일도 받는다)
 ```
 
-끝나면 `results/smoke-<시각>/report.md`에 단계별 표와 헤드라인이 나온다.
+단계마다 진행 줄이 출력된다. 끝나면 `results/smoke-<시각>/report.md`에 헤드라인과 단계별 표가 나온다. `target.base_url`에 아무것도 떠 있지 않으면 첫 단계 전에 멈추고 그렇게 알려 준다.
 
 ```
-**헤드라인**: stage 02: $0.000/1M out, $0.0000/1K turns, $0.000000/session (out tok/s 63.2, SLO PASS)
+**Headline**: stage 02: $0.000/1M out, $0.0000/1K turns, $0.000000/session (out tok/s 63.2, SLO PASS)
 
-| stage | conc | active sess | req/s | out tok/s | TTFT p50/p95/p99 | ITL p50/p95 | E2E p95 | err% | cache hit% | SLO | $/1M out | $/1K turns | $/session |
+| stage | conc | active sess | req/s | out tok/s | TTFT p50/p95/p99 (ms) | ITL p50/p95 (ms) | E2E p95 (ms) | err% | cache hit% | SLO | $/1M out | $/1K turns | $/session |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 01 | 2 | 2.0 (2–2) | 0.73 | 39.3 | 201/202/202 | 25.0/26.0 | 2089 | 0.0% | 68.6% (cached 보고 11/11건) | PASS | $0.000 | $0.0000 | $0.000000 |
-| 02 | 4 | 4.0 (4–4) | 1.33 | 63.2 | 201/202/202 | 25.0/26.0 | 2284 | 0.0% | 84.5% (cached 보고 20/20건) | PASS | $0.000 | $0.0000 | $0.000000 |
+| 01 | 2 | 2.0 (2–2) | 0.73 | 39.3 | 201/202/202 | 25.0/26.0 | 2089 | 0.0% | 68.6% (cached reported 11/11) | PASS | $0.000 | $0.0000 | $0.000000 |
+| 02 | 4 | 4.0 (4–4) | 1.33 | 63.2 | 201/201/202 | 25.0/26.0 | 2283 | 0.0% | 84.5% (cached reported 20/20) | PASS | $0.000 | $0.0000 | $0.000000 |
 ```
 
 mock 서버 옵션: `--ttft`, `--tps`, `--jitter`, `--error-rate`(HTTP 500 비율), `--cache-ttft-factor`(prefix cache 적중 시 TTFT 배율), `--no-usage`, `--seed`. 같은 seed와 같은 요청이면 출력 길이와 에러 여부가 항상 같다.
 
 ## 맥북에서 llama.cpp로 실행
+
+아래 기동 스크립트도 8000번 포트를 쓰므로 mock 서버를 먼저 끈다.
 
 ```bash
 brew install llama.cpp
@@ -68,16 +74,18 @@ personaload run scenarios/smoke.yaml
 
 ## GPU 서버에서 vLLM으로 실행
 
+Linux와 NVIDIA GPU를 가정한다.
+
 ```bash
 python -m venv ~/vllm && ~/vllm/bin/pip install vllm    # personaload와 다른 venv
 PATH=~/vllm/bin:$PATH scripts/vllm-linux.sh              # 기본 모델 Qwen/Qwen3-8B, max-model-len 32768
 ```
 
 - `--enable-prompt-tokens-details`를 켜 두었다. 그래야 응답 usage에 cached 토큰이 실려 리포트에 cache hit%가 나온다.
-- 기본 바인딩은 `127.0.0.1`이다. 다른 장비에서 부하를 걸려면 `HOST=0.0.0.0`으로 띄운다. 인증이 없으므로 신뢰하는 네트워크에서만 쓴다.
+- 기본 바인딩은 `127.0.0.1`이다. 다른 장비에서 부하를 걸려면 `HOST=0.0.0.0`으로 띄우고 시나리오의 `target.base_url`을 그 장비 주소로 바꾼다. 인증이 없으므로 신뢰하는 네트워크에서만 쓴다.
 - Qwen3는 기본으로 thinking을 한다. 끄지 않으면 짧은 `max_tokens`를 추론에 다 써 버린다(smoke.yaml 실측: 응답 48/48이 상한에서 끊김, 끈 뒤 30/55). 캐릭터챗에서 끄려면 시나리오에 `extra_body: {chat_template_kwargs: {enable_thinking: false}}`를 넣는다(예시 시나리오에 주석으로 있다).
 
-Apple Silicon 맥에서는 [vllm-metal](https://github.com/vllm-project/vllm-metal)(vLLM의 Metal/MLX 플러그인)로 같은 스크립트를 쓸 수 있다. 모델은 MLX 형식(`mlx-community/*`)이다.
+Apple Silicon 맥에서도 같은 `scripts/vllm-linux.sh`를(이름과 달리) [vllm-metal](https://github.com/vllm-project/vllm-metal)(vLLM의 Metal/MLX 플러그인)로 같은 스크립트를 쓸 수 있다. 모델은 MLX 형식(`mlx-community/*`)이다.
 
 ```bash
 brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
@@ -85,12 +93,14 @@ brew install vllm-project/vllm-metal/vllm-metal        # vLLM + Metal 플러그�
 MODEL=mlx-community/Qwen3-0.6B-4bit MAX_LEN=8192 scripts/vllm-linux.sh
 ```
 
+## 예시 시나리오
+
 | 시나리오 | 내용 | 시간 |
 |---|---|---|
 | [smoke.yaml](scenarios/smoke.yaml) | 페르소나 3개, 2~4턴, 동시성 2·4 | 약 1분 |
 | [persona-shared.yaml](scenarios/persona-shared.yaml) | 페르소나 5개를 Zipf로 공유, 5~30턴, 동시성 10·50·200, Prometheus 9090 | 약 12분 |
 | [persona-diverse.yaml](scenarios/persona-diverse.yaml) | 페르소나 500개를 고르게 사용, 나머지는 persona-shared와 같다 | 약 12분 |
-| [long-context.yaml](scenarios/long-context.yaml) | 30~50턴, 히스토리가 1만 토큰대까지 쌓인다, 동시성 8·32 | 약 11분 |
+| [long-context.yaml](scenarios/long-context.yaml) | 30~50턴, 히스토리가 평균 약 1.1만 토큰(최대 약 2.5만)까지 쌓인다, 동시성 8·32 | 약 11분 |
 | [rag-assistant.yaml](scenarios/rag-assistant.yaml) | 검색(RAG) 상담 챗봇: 지시문 1개 공유, 턴마다 검색 문서 800~2000토큰, $/session으로 상담 건당 원가 | 약 11분 |
 
 ## 결과 비교
@@ -129,7 +139,7 @@ curl -s http://127.0.0.1:9090/metrics | grep aiperf_time_to_first_token_ms
 |---|---|---|
 | `name`, `seed` | 결과 디렉터리 이름, 워크로드 시드(같은 시드면 데이터셋이 바이트 단위로 같다) | `name` 필수, `seed` 0 |
 | `target.base_url`, `target.model` | OpenAI 호환 엔드포인트와 모델 이름 | 필수 |
-| `target.api_key_env` | API 키를 담은 환경변수 이름(키는 결과 파일에 `***`로 가린다) | 없음 |
+| `target.api_key_env` | API 키를 담은 환경변수 이름(키는 결과 파일에 `***`로 가린다. 비어 있으면 `run`이 멈춘다) | 없음 |
 | `target.timeout` | 요청 타임아웃 | 120s |
 | `target.tokenizer` | AIPerf 토크나이저 | `builtin`(o200k_base) |
 | `target.max_tokens_field` | `max_completion_tokens` 또는 `max_tokens` | `max_completion_tokens` |
@@ -149,6 +159,9 @@ curl -s http://127.0.0.1:9090/metrics | grep aiperf_time_to_first_token_ms
 | `output.dir` | 결과 기본 디렉터리(`run --out`으로 덮어쓴다) | `results/` |
 | `output.prometheus_port`, `prometheus_host` | 실시간 `/metrics` | 없음(비활성), `127.0.0.1` |
 | `output.record_requests` | false면 단계가 끝난 뒤 요청 레코드 파일을 지운다(`stage.json`은 남는다) | true |
+
+- `think_time`은 `constant`가 아니면 `max`가 필요하다.
+- 상대 경로 `personas.file`은 시나리오 파일이 아니라 현재 디렉터리 기준이다.
 
 `personaload validate`가 규칙 위반을 오류로, 의심스러운 설정(예: `think_time.max > 60s`, `drain_timeout < target.timeout`)을 경고로 알려 준다.
 
@@ -198,6 +211,11 @@ results/<name>-<YYYYmmdd-HHMMSS>/
 - AIPerf `inputs.json`(대략 데이터셋 × 평균 턴 수 크기)은 단계가 끝나면 항상 지운다.
 - 단계가 실패하면(AIPerf 비정상 종료, 워치독) 남은 단계는 실행하지 않는다. AIPerf 0.12.0은 한 단계의 요청이 전부 실패해도 비정상 종료하므로, 대상 서버가 죽었으면 첫 단계에서 멈춘다.
 - **Ctrl+C 한 번**: AIPerf에 SIGINT를 한 번 전달하고, 부분 결과를 `partial` 단계로 저장한 뒤 남은 단계를 건너뛴다(종료 코드 130). SIGTERM·SIGHUP도 같다. **두 번째 Ctrl+C**는 AIPerf를 즉시 종료한다.
+
+## 그 밖의 명령
+
+- `personaload gen <시나리오> --out DIR`: 단계별 AIPerf 데이터셋(`stage_NN/dataset.jsonl`)만 만든다.
+- `personaload --version`, 그리고 하위 명령 앞에 `--log-level DEBUG|INFO|WARNING|ERROR`.
 
 ## 개발
 

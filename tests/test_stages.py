@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import socket
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -76,15 +77,15 @@ def test_stage_json_carries_metrics_verdict_cost_and_cpu_warnings(tmp_path):
     assert summary["requests"] == {"success": 12, "error": 0} and summary["cpu_warnings"] == 2
     assert summary["slo"] == {"verdict": "PASS", "violations": []}  # mock: ttft ~200ms, itl 25ms
     assert summary["out_tok_per_s"] > 0 and summary["usd_per_1m_out"] > 0
-    assert "AIPerf 워커 CPU 경고 2회: 결과가 부정확할 수 있다" in summary["warnings"]
+    assert "2 AIPerf worker CPU warnings: results may be inaccurate" in summary["warnings"]
 
 
 @pytest.mark.parametrize(
     ("outcome", "records", "expected"),
     [
-        (Outcome(0, "기동 워치독: x", False, 1), True, "기동 워치독"),
-        (Outcome(2, None, False, None), True, "종료 코드 2"),
-        (OK, False, "profile_export.jsonl이 없다"),
+        (Outcome(0, "startup watchdog: x", False, 1), True, "startup watchdog"),
+        (Outcome(2, None, False, None), True, "exit code 2"),
+        (OK, False, "no profile_export.jsonl"),
     ],
 )
 def test_failed_stages_carry_reason_and_log_tail(tmp_path, outcome, records, expected):
@@ -250,3 +251,46 @@ def test_aiperf_version_check(monkeypatch):
     monkeypatch.setattr(stages, "version", lambda _: "0.13.0")
     with pytest.raises(RuntimeError, match="0.12.0"):
         check_aiperf_version()
+
+
+def test_check_target_passes_a_listening_server_and_names_a_dead_one():
+    from personaload.config import TargetConfig
+    from personaload.runner.stages import check_target
+
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+        port = held.getsockname()[1]
+        check_target(TargetConfig(base_url=f"http://127.0.0.1:{port}/v1", model="m"))
+    with pytest.raises(
+        RuntimeError, match=rf"cannot reach .*127.0.0.1:{port}.*Is the server running"
+    ):
+        check_target(TargetConfig(base_url=f"http://127.0.0.1:{port}/v1", model="m"), 1.0)
+
+
+def test_check_target_rejects_an_empty_api_key_env(monkeypatch):
+    from personaload.config import TargetConfig
+    from personaload.runner.stages import check_target
+
+    monkeypatch.delenv("PL_TEST_KEY", raising=False)
+    target = TargetConfig(base_url="http://127.0.0.1:1/v1", model="m", api_key_env="PL_TEST_KEY")
+    with pytest.raises(RuntimeError, match="api_key_env names PL_TEST_KEY"):
+        check_target(target)
+
+
+def test_run_dirs_started_in_the_same_second_get_a_suffix(tmp_path, monkeypatch):
+    class Frozen:
+        @staticmethod
+        def now():
+            return datetime(2026, 10, 16, 1, 2, 3)
+
+    monkeypatch.setattr(stages, "datetime", Frozen)
+    first, second = stages._new_run_dir(tmp_path, "r"), stages._new_run_dir(tmp_path, "r")
+    assert (first.name, second.name) == ("r-20261016-010203", "r-20261016-010203-2")
+
+
+def test_failed_stage_keeps_only_the_log_tail(tmp_path):
+    log = tmp_path / "aiperf.log"
+    log.write_text("\n".join(f"line {i}" for i in range(100)))
+    tail = stages._tail(tmp_path / "missing.log", log).splitlines()
+    assert tail == [f"line {i}" for i in range(100 - stages.LOG_TAIL_LINES, 100)]

@@ -1,5 +1,5 @@
-# 인기 페르소나 5개를 여러 세션이 공유하는 캐릭터챗(Zipf 쏠림). prefix cache 효과가 크게 나는 형태다.
-# 대상: GPU 서버의 vLLM(scripts/vllm-linux.sh). 단계당 3분 30초, 전체 약 12분.
+# Character chat where many sessions share 5 popular personas (Zipf). Prefix caching pays off strongly here.
+# Target: vLLM on a GPU server (scripts/vllm-linux.sh). 3m30s per stage, ~12 min total.
 name: persona-shared
 seed: 42
 
@@ -7,7 +7,7 @@ target:
   base_url: http://127.0.0.1:8000/v1
   model: local-model
   timeout: 120s
-  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: thinking 끄기
+  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: turn thinking off
 
 personas:
   count: 5
@@ -39,4 +39,4 @@ cost:
   label: RunPod L40S
 
 output:
-  prometheus_port: 9090               # 실행 중 http://127.0.0.1:9090/metrics
+  prometheus_port: 9090               # live at http://127.0.0.1:9090/metrics during the run

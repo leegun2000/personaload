@@ -52,8 +52,9 @@ def concurrency_session_count(scenario: Scenario, stage: ConcurrencyStage) -> in
     think_ms = session_think_ms(scenario)
     if think_ms < MIN_SESSION_THINK_MS:
         raise WorkloadError(
-            f"세션당 기대 think time L={think_ms / 1000:.3f}s < 1s: 세션 수를 산정할 수 없다. "
-            "turns·think_time을 늘리거나 단계에 sessions를 지정한다"
+            f"expected think time per session L={think_ms / 1000:.3f}s < 1s: "
+            "cannot size the session pool. "
+            "Raise turns or think_time, or set sessions on the stage"
         )
     horizon_ms = stage.warmup + stage.duration
     factor = scenario.load.session_pool_factor

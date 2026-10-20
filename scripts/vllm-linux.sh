@@ -13,7 +13,7 @@ set -euo pipefail
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 HOST="${HOST:-127.0.0.1}"     # 0.0.0.0 to benchmark from another machine (no auth: trusted networks only)
 PORT="${PORT:-8000}"
-MAX_LEN="${MAX_LEN:-32768}"   # long-context.yaml reaches ~25k tokens of history
+MAX_LEN="${MAX_LEN:-32768}"   # long-context.yaml: ~11k tokens of history on average, up to ~25k
 
 if ! command -v vllm >/dev/null; then
   echo "vllm not found: pip install vllm (in its own venv)" >&2

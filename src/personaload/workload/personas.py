@@ -126,7 +126,7 @@ def file_personas(path: Path, count: int | None) -> list[Persona]:
         # allows raw inside strings (AIPerf reads JSONL the same way)
         lines = path.read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeDecodeError) as exc:
-        raise PersonaError(f"페르소나 파일을 읽을 수 없다: {exc}") from exc
+        raise PersonaError(f"cannot read the persona file: {exc}") from exc
     personas: list[Persona] = []
     for lineno, line in enumerate(lines, 1):
         if not line.strip():
@@ -134,22 +134,22 @@ def file_personas(path: Path, count: int | None) -> list[Persona]:
         try:
             row = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise PersonaError(f"{path}:{lineno}: JSON 파싱 실패: {exc}") from exc
+            raise PersonaError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
         if not isinstance(row, dict) or not isinstance(row.get("system_prompt"), str):
-            raise PersonaError(f'{path}:{lineno}: {{"name", "system_prompt"}} 객체가 아니다')
+            raise PersonaError(f'{path}:{lineno}: not a {{"name", "system_prompt"}} object')
         if not row["system_prompt"].strip():
             continue
         try:
             row["system_prompt"].encode("utf-8")
         except UnicodeEncodeError as exc:
             raise PersonaError(
-                f"{path}:{lineno}: UTF-8로 인코딩할 수 없는 문자(짝 없는 서로게이트)"
+                f"{path}:{lineno}: characters that cannot be encoded as UTF-8 (lone surrogates)"
             ) from exc
         personas.append(Persona(len(personas), str(row.get("name", "")), row["system_prompt"]))
         if count is not None and len(personas) == count:
             break
     if not personas:
-        raise PersonaError(f"{path}: system_prompt가 비어 있지 않은 줄이 없다")
+        raise PersonaError(f"{path}: no line with a non-empty system_prompt")
     return personas
 
 

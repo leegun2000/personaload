@@ -118,16 +118,20 @@ def _warnings(scenario: Scenario, means: list[DistMean]) -> list[str]:
     think = scenario.session.think_time
     think_max = think.value if think.dist == "constant" else think.max
     if think_max > THINK_WARN_MS:
-        warnings.append("session.think_time 최대가 60s를 넘는다. AIPerf도 로드 시 한 번 경고한다")
+        warnings.append(
+            "session.think_time max exceeds 60s; AIPerf also warns once when it loads the dataset"
+        )
     if scenario.load.drain_timeout < scenario.target.timeout:
         warnings.append(
-            "load.drain_timeout < target.timeout: drain 뒤 취소되는 요청은 레코드 없이 검열된다"
+            "load.drain_timeout < target.timeout: requests cancelled after the drain "
+            "leave no record and are censored"
         )
     for m in means:
         if m.configured and abs(m.clamped - m.configured) / m.configured > MEAN_DEVIATION_WARN:
             warnings.append(
-                f"{m.name}: 클램프 후 평균({m.clamped:.4g})이 설정 평균({m.configured:.4g})과 "
-                f"{MEAN_DEVIATION_WARN:.0%} 넘게 다르다"
+                f"{m.name}: the clamped mean ({m.clamped:.4g}) differs from "
+                f"the configured mean ({m.configured:.4g}) "
+                f"by more than {MEAN_DEVIATION_WARN:.0%}"
             )
     return warnings
 
@@ -145,8 +149,8 @@ def check_scenario(scenario: Scenario, personas: list[Persona]) -> Checks:
         if estimate.dataset_bytes > MAX_DATASET_BYTES:
             gib = estimate.dataset_bytes / 2**30
             errors.append(
-                f"load.stages.{stage_no - 1}: 예상 dataset.jsonl {gib:.2f} GiB > 1 GiB. "
-                "세션 수(session_pool_factor, sessions)나 페르소나 길이를 줄인다"
+                f"load.stages.{stage_no - 1}: expected dataset.jsonl {gib:.2f} GiB > 1 GiB. "
+                "Reduce the session count (session_pool_factor, sessions) or the persona length"
             )
         stages.append(estimate)
     return Checks(tuple(errors), tuple(_warnings(scenario, means)), tuple(means), tuple(stages))

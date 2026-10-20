@@ -98,7 +98,7 @@ def test_prefix_cache_longest_hit():
         ({"tps": 0}, "tps"),
         ({"ttft_ms": -1}, "ttft"),
         ({"cache_ttft_factor": -0.5}, "cache-ttft-factor"),
-        ({"error_rate": 30}, re.escape("비율(0~1)")),
+        ({"error_rate": 30}, re.escape("fraction (0-1)")),
         ({"error_rate": -0.1}, "error-rate"),
         ({"port": 0}, "port"),
     ],

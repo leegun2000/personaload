@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from personaload.config import CostConfig, SloConfig
 
 PASS, FAIL, NA = "PASS", "FAIL", "N/A"
-NO_PASSING_STAGE = "SLO를 통과한 단계 없음"
+NO_PASSING_STAGE = "no stage passed the SLO"
 LAG_P99_WARN_MS = 100.0
 
 
@@ -67,33 +67,38 @@ def stage_warnings(summary: dict) -> list[str]:
     warnings = []
     if n := summary.get("reused_conversations"):
         warnings.append(
-            f"데이터셋 재사용 발생: 대화 {n}개가 두 번 이상 재생됐다 "
-            "(단계 sessions나 load.session_pool_factor를 늘린다)"
+            f"dataset reused: {n} conversations were replayed more than once "
+            "(raise the stage's sessions or load.session_pool_factor)"
         )
     if n := (summary.get("active_sessions") or {}).get("unobserved"):
-        warnings.append(f"turn 0 레코드가 없는 세션 인스턴스 {n}개는 활성 세션에서 뺐다")
+        warnings.append(
+            f"{n} session instances without a turn-0 record were left out of active sessions"
+        )
     drain = summary.get("drain_cancelled")
     if drain:
         warnings.append(
-            f"drain 뒤 취소 {drain}건: 에러율에 넣었고, 지연 백분위는 검열된 하한값이다"
+            f"{drain} requests cancelled after the drain: counted as errors; "
+            "latency percentiles are censored lower bounds"
         )
     elif drain is None and summary.get("status") == "ok":
-        warnings.append("drain 취소 미확인: aiperf.log에서 phase 완료 줄을 찾지 못했다")
+        warnings.append("drain cancellations unknown: no phase-complete line in aiperf.log")
     if n := summary.get("user_cancelled"):
-        warnings.append(f"중단으로 취소된 진행 중 요청 {n}건: 레코드가 없어 집계에서 빠졌다")
+        warnings.append(
+            f"{n} in-flight requests cancelled by the interrupt: no records, left out of the stats"
+        )
     if n := summary.get("usage_missing"):
-        warnings.append(f"usage 없음: 청크 수로 대체 ({n}건)")
+        warnings.append(f"no usage: output tokens counted from chunks ({n} requests)")
     lag = summary.get("think_lag_ms") or {}
     if (p99 := lag.get("p99")) is not None and p99 > LAG_P99_WARN_MS:
         excluded = lag.get("excluded_after_error", 0)
         warnings.append(
             f"think lag p99 {p99:.0f}ms > {LAG_P99_WARN_MS:.0f}ms "
-            f"(에러 턴 뒤 쌍 {excluded}개 제외): 클라이언트 병목 의심"
+            f"({excluded} pairs after an error turn excluded): client bottleneck suspected"
         )
     if n := lag.get("below_clock_floor"):
-        warnings.append(f"시계 보정 의심: lag가 -5ms보다 작은 턴 쌍 {n}개")
+        warnings.append(f"clock skew suspected: {n} turn pairs with lag below -5ms")
     if n := summary.get("cpu_warnings"):
-        warnings.append(f"AIPerf 워커 CPU 경고 {n}회: 결과가 부정확할 수 있다")
+        warnings.append(f"{n} AIPerf worker CPU warnings: results may be inaccurate")
     return warnings
 
 

@@ -1,5 +1,5 @@
-# 30~50턴까지 이어지는 긴 대화. 히스토리가 쌓여 입력이 1만 토큰대까지 커진다.
-# 대상: max-model-len 32k 이상인 서버(scripts/vllm-linux.sh 기본값). 단계당 5분 30초, 전체 약 11분.
+# Long conversations of 30-50 turns. History grows the input to ~11k tokens on average (up to ~25k).
+# Target: a server with max-model-len >= 32k (the scripts/vllm-linux.sh default). 5m30s per stage, ~11 min total.
 name: long-context
 seed: 7
 
@@ -7,7 +7,7 @@ target:
   base_url: http://127.0.0.1:8000/v1
   model: local-model
   timeout: 180s
-  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: thinking 끄기
+  # extra_body: {chat_template_kwargs: {enable_thinking: false}}   # Qwen3: turn thinking off
 
 personas:
   count: 20

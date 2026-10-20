@@ -89,49 +89,58 @@ def _errors(data) -> str:
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
-        ({"session": {"turns": {"dist": "uniform", "min": 5, "max": 2}}}, "min ≤ max"),
-        ({"session": {"turns": {"dist": "uniform", "min": 0, "max": 3}}}, "turns의 최솟값"),
+        ({"session": {"turns": {"dist": "uniform", "min": 5, "max": 2}}}, "min must be <= max"),
+        (
+            {"session": {"turns": {"dist": "uniform", "min": 0, "max": 3}}},
+            "turns must be at least 1",
+        ),
         (
             {"session": {"user_input_tokens": {"dist": "exponential", "mean": 20}}},
-            "user_input_tokens의 최솟값",
+            "user_input_tokens must be at least 1",
         ),
         (
             {"session": {"max_output_tokens": {"dist": "constant", "value": 0}}},
-            "max_output_tokens의 최솟값",
+            "max_output_tokens must be at least 1",
         ),
-        ({"session": {"turns": {"dist": "uniform", "min": 1.5, "max": 3}}}, "정수"),
+        ({"session": {"turns": {"dist": "uniform", "min": 1.5, "max": 3}}}, "integer"),
         (
             {"session": {"turns": {"dist": "lognormal", "mean": 0, "stddev": 1, "min": 1}}},
-            "mean > 0",
+            "mean must be > 0",
         ),
         (
             {"session": {"turns": {"dist": "lognormal", "mean": 3, "stddev": -1, "min": 1}}},
-            "0 이상",
+            ">= 0",
         ),
         (
             {"session": {"turns": {"dist": "constant", "value": 9, "min": 1, "max": 5}}},
-            "[min, max] 안",
+            "within [min, max]",
         ),
-        ({"session": {"turns": {"dist": "uniform", "min": 1}}}, "max가 필요"),
+        ({"session": {"turns": {"dist": "uniform", "min": 1}}}, "needs max"),
         (
             {"session": {"turns": {"dist": "uniform", "min": 1, "max": 3, "mean": 2}}},
-            "mean를 쓰지 않는다",
+            "does not use mean",
         ),
-        ({"session": {"think_time": {"dist": "exponential", "mean": "2s"}}}, "think_time에는 max"),
-        ({"session": {"think_time": {"dist": "exponential", "mean": 2000, "max": "5s"}}}, "기간"),
+        (
+            {"session": {"think_time": {"dist": "exponential", "mean": "2s"}}},
+            "think_time needs max",
+        ),
+        (
+            {"session": {"think_time": {"dist": "exponential", "mean": 2000, "max": "5s"}}},
+            "duration",
+        ),
         ({"session": {"zipf_s": 0}}, "zipf_s > 0"),
         ({"personas": {"count": 0}}, "greater than or equal to 1"),
-        ({"personas": {"count": None}}, "count와 system_prompt_tokens"),
+        ({"personas": {"count": None}}, "needs count and system_prompt_tokens"),
         (
             {"personas": {"system_prompt_tokens": {"min": 0, "max": 10}}},
-            "system_prompt_tokens의 최솟값",
+            "system_prompt_tokens must be at least 1",
         ),
         (
             {"personas": {"source": "file", "count": None, "system_prompt_tokens": None}},
-            "file이 필요",
+            "source=file needs file",
         ),
         ({"load": {"stages": [{"concurrency": 0, "duration": "10s"}]}}, "stages.0.concurrency"),
-        ({"load": {"stages": [{"concurrency": 1, "duration": "0s"}]}}, "duration > 0"),
+        ({"load": {"stages": [{"concurrency": 1, "duration": "0s"}]}}, "duration must be > 0"),
         (
             {"load": {"stages": [{"concurrency": 1, "duration": "1s", "sessions_per_sec": 2}]}},
             "sessions_per_sec",
@@ -147,16 +156,16 @@ def _errors(data) -> str:
         ),
         ({"load": {"stages": []}}, "at least 1"),
         ({"load": {"session_pool_factor": 0.5}}, "session_pool_factor"),
-        ({"load": {"drain_timeout": "-1s"}}, "기간"),
+        ({"load": {"drain_timeout": "-1s"}}, "duration"),
         ({"slo": {"error_rate_max": 1.5}}, "error_rate_max"),
-        ({"slo": {"ttft_p95": "0s"}}, "0보다 커야"),
+        ({"slo": {"ttft_p95": "0s"}}, "must be > 0"),
         ({"cost": {"gpu_hourly_usd": -1}}, "gpu_hourly_usd"),
         ({"cost": {"gpu_count": 0}}, "gpu_count"),
         (
             {"session": {"retrieved_tokens": {"dist": "constant", "value": 0}}},
-            "retrieved_tokens의 최솟값",
+            "retrieved_tokens must be at least 1",
         ),
-        ({"target": {"timeout": "0s"}}, "timeout > 0"),
+        ({"target": {"timeout": "0s"}}, "timeout must be > 0"),
         ({"output": {"prometheus_port": 70000}}, "prometheus_port"),
         ({"name": "bad name/"}, "name"),
         ({"unknown": 1}, "unknown"),
@@ -172,7 +181,7 @@ def test_constant_think_time_needs_no_max():
 
 
 def test_load_scenario_reports_io_and_yaml_errors(tmp_path):
-    with pytest.raises(ScenarioError, match="읽을 수 없다"):
+    with pytest.raises(ScenarioError, match="cannot read"):
         load_scenario(tmp_path / "missing.yaml")
     bad = tmp_path / "bad.yaml"
     bad.write_text("name: [unclosed", encoding="utf-8")
@@ -185,9 +194,9 @@ def test_load_scenario_reports_io_and_yaml_errors(tmp_path):
     [
         (
             {"session": {"think_time": {"dist": "exponential", "mean": "0s", "max": "5s"}}},
-            "mean > 0",
+            "mean must be > 0",
         ),
-        ({"slo": {"itl_p95": "0ms"}}, "0보다 커야"),
+        ({"slo": {"itl_p95": "0ms"}}, "must be > 0"),
         ({"slo": {"error_rate_max": -0.1}}, "error_rate_max"),
         (
             {
@@ -236,10 +245,10 @@ def test_load_scenario_reports_io_and_yaml_errors(tmp_path):
             },
             "sessions",
         ),
-        ({"session": {"turns": {"dist": "constant", "value": 1.4}}}, "value는 정수"),
+        ({"session": {"turns": {"dist": "constant", "value": 1.4}}}, "value must be an integer"),
         (
             {"session": {"turns": {"dist": "lognormal", "mean": 1.4, "stddev": 0, "min": 1}}},
-            "mean는 정수",
+            "mean must be an integer",
         ),
         ({"session": {"zipf_s": float("nan")}}, "finite"),
         (
@@ -302,3 +311,36 @@ def test_relative_persona_file_is_made_absolute_for_reruns(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     scenario = load_scenario(path)
     assert scenario.personas.file == str(tmp_path.resolve() / "data" / "p.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"slo": {"error_rate_max": True}}, "error_rate_max"),
+        ({"cost": {"gpu_hourly_usd": "2.5"}}, "gpu_hourly_usd"),
+        ({"session": {"turns": {"min": True, "max": 4}}}, "turns"),
+        (
+            {
+                "session": {
+                    "user_input_tokens": {
+                        "dist": "lognormal",
+                        "mean": 1,
+                        "stddev": 1e200,
+                        "min": 1,
+                        "max": 9,
+                    }
+                }
+            },
+            "too large",
+        ),
+    ],
+)
+def test_yaml_booleans_strings_and_overflowing_lognormal_are_rejected(overrides, expected):
+    assert expected in _errors(make_dict(**overrides))
+
+
+def test_non_utf8_scenario_is_a_clean_error(tmp_path):
+    path = tmp_path / "s.yaml"
+    path.write_bytes(b"name: \xff\xfe\n")
+    with pytest.raises(ScenarioError, match="cannot read"):
+        load_scenario(path)
